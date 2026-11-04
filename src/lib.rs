@@ -11,8 +11,10 @@
 //!    filters, tests and global functions.
 //! 2. **`py()`** — evaluate an inline snippet:
 //!    `{{ py("sum(o['total'] for o in orders)") }}`.
-//! 3. **`py_block`** — run a block and emit what it prints:
-//!    `{% call py_block() %}for o in orders: print(o['id']){% endcall %}`.
+//! 3. **`{% python %}`** — run a block and emit what it prints:
+//!    `{% python %}for o in orders: print(o['id']){% endpython %}`. MiniJinja
+//!    has no custom tags, so the source is expanded into a `py_block` call
+//!    first, with [`expand_python_tags`] or [`python_tag_loader`].
 //!
 //! Python code can call back into the template engine with `render(name,
 //! **ctx)`, `render_string(source, **ctx)` and `apply_filter(name, value,
@@ -41,16 +43,18 @@ mod error;
 mod inline;
 mod module;
 mod runtime;
+mod tags;
 
 use std::sync::Arc;
 
 use minijinja::Environment;
 
-pub use config::{Config, ModuleStrategy};
+pub use config::{Config, Isolation, ModuleStrategy};
 pub use convert::{from_monty, to_monty};
 pub use error::{LoadError, PythonError};
 pub use module::{Export, ExportKind, PythonModule};
 pub use monty_types::{OsPolicy, ResourceLimits};
+pub use tags::{expand_python_tags, python_tag_loader};
 
 /// Collects Python modules and installs them, plus `py()` and `py_block`,
 /// into MiniJinja environments.

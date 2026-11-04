@@ -5,7 +5,13 @@
 //! snapshot, so calls share no Python state: a filter cannot leak data from
 //! one render into another, and any number of threads can render
 //! concurrently.
+//!
+//! Every step that executes interpreter code goes through [`contained`], so
+//! a Rust panic inside Monty fails that one call instead of unwinding
+//! through the template engine.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, PoisonError};
 
 use minijinja::value::Kwargs;
@@ -118,14 +124,14 @@ impl<'a> Execution<'a> {
     ) -> Result<RunProgress, PythonError> {
         let tracker = ResourceTracker::new(self.config.limits.clone());
         let program = program.fork();
-        let result = program.start(inputs, tracker, self.writer());
-        result.map_err(|exc| self.fail(exc))
+        let writer = self.writer();
+        contained(|| program.start(inputs, tracker, writer)).map_err(|exc| self.fail(exc))
     }
 
     /// Answers a suspended call — typically a restored checkpoint.
     pub fn resume(&mut self, call: FunctionCall, value: MontyObject) -> Result<RunProgress, PythonError> {
-        let result = call.resume(value, self.writer());
-        result.map_err(|exc| self.fail(exc))
+        let writer = self.writer();
+        contained(|| call.resume(value, writer)).map_err(|exc| self.fail(exc))
     }
 
     /// Serves suspensions until the program completes or calls `checkpoint`.
@@ -155,7 +161,9 @@ impl<'a> Execution<'a> {
                 RunProgress::FunctionCall(call) if Some(call.function_name.as_str()) == checkpoint => {
                     return Ok(Stop::Checkpoint(Box::new(call)));
                 }
-                RunProgress::FunctionCall(call) if over_budget => call.abort(budget_exc, writer),
+                RunProgress::FunctionCall(call) if over_budget => {
+                    contained(|| call.abort(budget_exc, writer))
+                }
                 RunProgress::FunctionCall(call) => {
                     let result = match state.as_deref_mut() {
                         Some(state) => call_host(state, &call.function_name, &call.args),
@@ -167,9 +175,11 @@ impl<'a> Execution<'a> {
                             )),
                         )),
                     };
-                    call.resume(result, writer)
+                    contained(|| call.resume(result, writer))
                 }
-                RunProgress::NameLookup(lookup) if over_budget => lookup.abort(budget_exc, writer),
+                RunProgress::NameLookup(lookup) if over_budget => {
+                    contained(|| lookup.abort(budget_exc, writer))
+                }
                 RunProgress::NameLookup(lookup) => {
                     let result = match (names, state.as_deref()) {
                         (NameResolution::TemplateContext, Some(state)) => {
@@ -177,7 +187,7 @@ impl<'a> Execution<'a> {
                         }
                         _ => NameLookupResult::Undefined,
                     };
-                    lookup.resume(result, writer)
+                    contained(|| lookup.resume(result, writer))
                 }
                 // The sandbox has no filesystem or environment; refuse rather
                 // than silently answering with fabricated data.
@@ -186,17 +196,17 @@ impl<'a> Execution<'a> {
                         ExcType::NotImplementedError,
                         Some(format!("{:?} is not available in templates", call.function_call)),
                     );
-                    call.resume(ExtFunctionResult::Error(exc), writer)
+                    contained(|| call.resume(ExtFunctionResult::Error(exc), writer))
                 }
                 // Host functions answer synchronously, so the only way to
                 // reach this is `await` on something we never handed out.
-                RunProgress::ResolveFutures(futures) => futures.abort(
-                    MontyException::new(
+                RunProgress::ResolveFutures(futures) => {
+                    let exc = MontyException::new(
                         ExcType::RuntimeError,
                         Some("async code is not supported in templates".to_owned()),
-                    ),
-                    writer,
-                ),
+                    );
+                    contained(|| futures.abort(exc, writer))
+                }
             };
             progress = next.map_err(|exc| self.fail(exc))?;
         }
@@ -215,6 +225,36 @@ impl<'a> Execution<'a> {
             Stop::Checkpoint(_) => unreachable!("no checkpoint was requested"),
         }
     }
+}
+
+/// Runs one interpreter step, converting a panic inside Monty into a Python
+/// `RuntimeError`.
+///
+/// `AssertUnwindSafe` is sound here because the step owns the interpreter
+/// state it advances: on a panic that state is dropped with the closure and
+/// never observed again. The only borrowed data, the print buffer, is a
+/// `String` and stays valid whatever was appended. Host callbacks run outside
+/// this boundary, so panics in the host's own filters still propagate as
+/// they would without this crate. Containment requires `panic = "unwind"`
+/// (Rust's default); under `panic = "abort"` the process still terminates.
+pub(crate) fn contained<T>(step: impl FnOnce() -> Result<T, MontyException>) -> Result<T, MontyException> {
+    catch_unwind(AssertUnwindSafe(step)).unwrap_or_else(|payload| {
+        Err(MontyException::new(
+            ExcType::RuntimeError,
+            Some(format!(
+                "internal interpreter error: {}",
+                panic_message(&*payload)
+            )),
+        ))
+    })
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic with a non-string payload")
 }
 
 fn lookup_template_name(state: &State<'_, '_>, name: &str) -> NameLookupResult {
@@ -283,4 +323,20 @@ fn dispatch_host(state: &mut State<'_, '_>, name: &str, args: &CallArgs) -> Resu
 /// sandboxed code can catch them like any other exception.
 fn host_exception(err: &Error) -> MontyException {
     MontyException::new(ExcType::RuntimeError, Some(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contained;
+
+    #[test]
+    fn panics_become_python_runtime_errors() {
+        let result = contained::<()>(|| panic!("heap corrupted"));
+        let exc = result.unwrap_err();
+        assert_eq!(
+            exc.summary(),
+            "RuntimeError: internal interpreter error: heap corrupted"
+        );
+        assert_eq!(contained(|| Ok(7)).unwrap(), 7);
+    }
 }

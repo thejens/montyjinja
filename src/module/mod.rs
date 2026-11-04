@@ -11,68 +11,46 @@
 //!     return n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
 //! ```
 
+mod registry;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use minijinja::value::{Rest, ValueOrKwargs};
 use minijinja::{Environment, Error, State, Value};
 use monty::{FunctionCall, MontyRun};
-use monty_types::{CompileOptions, ExcType, MontyException, MontyObject, ObjectRef};
+use monty_types::{CompileOptions, ExcType, MontyException, MontyObject};
 
-use crate::config::{Config, ModuleStrategy};
-use crate::convert::{from_monty, repr_text, to_monty};
+use crate::config::{Config, Isolation, ModuleStrategy};
+use crate::convert::{from_monty, to_monty};
 use crate::error::{LoadError, PythonError};
 use crate::runtime::{Execution, HOST_FUNCTIONS, NameResolution, Script, SharedProgram, Stop};
+pub use registry::{Export, ExportKind};
+use registry::{PRELUDE, PRELUDE_LINES, parse_registry};
 
-/// Defines the registration decorators. It must stay on ONE line: it is
-/// prepended to user source, and tracebacks are corrected by exactly
-/// `PRELUDE_LINES`. Monty has neither `callable()` nor `fn.__name__`, so a
-/// bare `@template_filter` is told apart from `@template_filter('name')` by
-/// argument type, and bare names are recovered from the function's repr
-/// after the module runs (see `function_name_from_repr`).
-const PRELUDE: &str = "__mj_reg__ = {'filter': [], 'test': [], 'global': []}; \
-__mj_dec__ = lambda k, a: (lambda fn: (__mj_reg__[k].append((a, fn)), fn)[1]) if a is None or isinstance(a, str) else (__mj_reg__[k].append((None, a)), a)[1]; \
-template_filter = lambda a=None: __mj_dec__('filter', a); \
-template_test = lambda a=None: __mj_dec__('test', a); \
-template_global = lambda a=None: __mj_dec__('global', a)\n";
-const PRELUDE_LINES: u32 = 1;
-
-/// After the module's top level, the program calls the `CHECKPOINT` host
-/// function with the registry and suspends. The host reads the exports from
-/// that call at load time; for each template call it resumes the checkpoint
-/// with `(kind, index, args, kwargs)` and the program dispatches. Pausing
-/// there is what lets a fully initialised module be snapshotted once and
-/// restored per call (see `ModuleStrategy`).
-const DISPATCH: &str = "\n__mj_kind__, __mj_index__, __mj_args__, __mj_kwargs__ = __mj_ready__(__mj_reg__)\n\
-__mj_reg__[__mj_kind__][__mj_index__][1](*__mj_args__, **__mj_kwargs__)\n";
+/// After the module's top level, the program loops forever: it calls the
+/// `CHECKPOINT` host function and suspends, the host resumes it with
+/// `(kind, index, args, kwargs)`, it dispatches, and it hands the result to
+/// the next checkpoint call.
+///
+/// The first checkpoint carries the registry, from which the host reads the
+/// exports at load time. Every later one carries a call's result. Because
+/// the program is always paused at the same place between calls, a fully
+/// initialised module can be snapshotted once and restored per call (see
+/// `ModuleStrategy`), or kept suspended and resumed again by the next call
+/// in the same render (see `Isolation::PerRender`).
+const DISPATCH: &str = "\n__mj_out__ = __mj_reg__\n\
+while True:\n    \
+__mj_kind__, __mj_index__, __mj_args__, __mj_kwargs__ = __mj_ready__(__mj_out__)\n    \
+__mj_out__ = __mj_reg__[__mj_kind__][__mj_index__][1](*__mj_args__, **__mj_kwargs__)\n";
 const CHECKPOINT: &str = "__mj_ready__";
 
-/// What a Python function is registered as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportKind {
-    Filter,
-    Test,
-    Global,
-}
-
-impl ExportKind {
-    const ALL: [Self; 3] = [Self::Filter, Self::Test, Self::Global];
-
-    fn key(self) -> &'static str {
-        match self {
-            Self::Filter => "filter",
-            Self::Test => "test",
-            Self::Global => "global",
-        }
-    }
-}
-
-/// One exported Python function.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Export {
-    pub kind: ExportKind,
-    pub name: String,
-    index: usize,
-}
+/// Suspended module programs kept for the rest of a render under
+/// `Isolation::PerRender`, keyed by `ModuleInner::id`. Stored as a typed
+/// render-local extension, so MiniJinja drops it, and every interpreter in
+/// it, when the render's `State` goes away.
+#[derive(Default)]
+struct Sessions(HashMap<usize, FunctionCall>);
 
 /// A loaded, validated Python module, ready to be installed into any number
 /// of environments. Cheap to clone.
@@ -194,39 +172,73 @@ impl ModuleInner {
             .map(|name| MontyObject::function(name, None))
             .collect();
         let progress = execution.start(&self.program, inputs)?;
-        match execution.drive(progress, None, Some(CHECKPOINT))? {
+        let stop = execution.drive(progress, None, Some(CHECKPOINT))?;
+        Self::next_checkpoint(execution, stop)
+    }
+
+    /// The checkpoint the dispatch loop suspended at.
+    fn next_checkpoint(execution: &mut Execution<'_>, stop: Stop) -> Result<FunctionCall, PythonError> {
+        match stop {
             Stop::Checkpoint(call) => Ok(*call),
+            // The dispatch loop never exits on its own; reaching the end
+            // means user code subverted it (e.g. rebound `__mj_ready__`).
             Stop::Complete(_) => Err(execution.fail(MontyException::new(
                 ExcType::RuntimeError,
-                Some("module finished without reaching its dispatch point".to_owned()),
+                Some("module left its dispatch loop".to_owned()),
             ))),
         }
     }
 
-    fn call(&self, state: &mut State<'_, '_>, export: &Export, args: &[Value]) -> Result<Value, Error> {
-        let args = split_kwargs(args)?;
-        let result = self.invoke(state, export, args).map_err(|err| {
-            err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
-        })?;
-        from_monty(result.as_ref())
+    /// Identifies this module among the sessions of a render. The address is
+    /// stable and unique for as long as an installed closure holds the `Arc`.
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
     }
 
+    fn call(&self, state: &mut State<'_, '_>, export: &Export, args: &[Value]) -> Result<Value, Error> {
+        let args = split_kwargs(args)?;
+        let checkpoint = self.invoke(state, export, args).map_err(|err| {
+            err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
+        })?;
+        let result = checkpoint.args.arg(0).map(from_monty).transpose()?;
+        if self.config.isolation == Isolation::PerRender {
+            state
+                .get_or_insert_extension_with(Sessions::default)
+                .0
+                .insert(self.id(), checkpoint);
+        }
+        Ok(result.unwrap_or_default())
+    }
+
+    /// Runs one call and returns the checkpoint the module suspends at
+    /// afterwards, which carries the call's result as its argument.
     fn invoke(
         &self,
         state: &mut State<'_, '_>,
         export: &Export,
         args: PyArgs,
-    ) -> Result<MontyObject, PythonError> {
+    ) -> Result<FunctionCall, PythonError> {
         let mut execution = self.execution();
-        let checkpoint = match &self.snapshot {
+        // Taken out rather than borrowed: the call may re-enter this module
+        // through `apply_filter` with the same `State`. The nested call then
+        // finds no session and starts pristine, and whichever call finishes
+        // last leaves its session behind.
+        let session = match self.config.isolation {
+            Isolation::PerRender => state
+                .get_extension_mut::<Sessions>()
+                .and_then(|sessions| sessions.0.remove(&self.id())),
+            Isolation::PerCall => None,
+        };
+        let checkpoint = match (session, &self.snapshot) {
+            (Some(session), _) => session,
             // The bytes were produced by this process from a value of the
             // same type, so decoding can only fail on a Monty bug.
-            Some(bytes) => postcard::from_bytes::<FunctionCall>(bytes)
+            (None, Some(bytes)) => postcard::from_bytes::<FunctionCall>(bytes)
                 .map_err(|err| execution.fail(MontyException::runtime_error(err)))?,
-            None => self.run_to_checkpoint(&mut execution)?,
+            (None, None) => self.run_to_checkpoint(&mut execution)?,
         };
         // Each call gets the full time budget, regardless of how long the
-        // module's top level took when the snapshot was made.
+        // module's top level (or earlier calls in the render) took.
         checkpoint.tracker().on_feed_start();
         let dispatch = MontyObject::tuple([
             MontyObject::string(export.kind.key()),
@@ -235,10 +247,8 @@ impl ModuleInner {
             MontyObject::dict(args.keyword),
         ]);
         let progress = execution.resume(checkpoint, dispatch)?;
-        match execution.drive(progress, Some(state), None)? {
-            Stop::Complete(value) => Ok(value),
-            Stop::Checkpoint(_) => unreachable!("no checkpoint was requested"),
-        }
+        let stop = execution.drive(progress, Some(state), Some(CHECKPOINT))?;
+        Self::next_checkpoint(&mut execution, stop)
     }
 }
 
@@ -267,67 +277,4 @@ fn split_kwargs(args: &[Value]) -> Result<PyArgs, Error> {
         positional,
         keyword: pairs,
     })
-}
-
-fn parse_registry(registry: ObjectRef<'_>) -> Result<Vec<Export>, LoadError> {
-    let invalid = |msg: &str| LoadError::Invalid(msg.to_owned());
-    let pairs = registry
-        .pairs()
-        .ok_or_else(|| invalid("registry is not a dict"))?;
-    let mut exports = Vec::new();
-    for kind in ExportKind::ALL {
-        let entries = pairs
-            .iter()
-            .find(|(key, _)| key.as_str() == Some(kind.key()))
-            .and_then(|(_, list)| list.items())
-            .ok_or_else(|| invalid("registry is missing a kind"))?;
-        for (index, entry) in entries.into_iter().enumerate() {
-            let parts = entry.items().ok_or_else(|| invalid("malformed registry entry"))?;
-            let [explicit, function] = parts.as_slice() else {
-                return Err(invalid("malformed registry entry"));
-            };
-            let name = match explicit.as_str() {
-                Some(name) => name.to_owned(),
-                None => function_name_from_repr(&repr_text(*function)).ok_or_else(|| {
-                    LoadError::Invalid(format!(
-                        "cannot infer a {} name for {}; pass one explicitly, e.g. @template_{}('name')",
-                        kind.key(),
-                        repr_text(*function),
-                        kind.key()
-                    ))
-                })?,
-            };
-            exports.push(Export { kind, name, index });
-        }
-    }
-    Ok(exports)
-}
-
-/// Extracts `name` from Monty's function repr, `<function 'name' at 0x..>`.
-///
-/// Load-bearing workaround: Monty does not expose `__name__`, and returns
-/// function objects to the host only as their repr. Lambdas (`<lambda>`)
-/// are rejected because they have no usable name.
-fn function_name_from_repr(repr: &str) -> Option<String> {
-    let rest = repr.strip_prefix("<function '")?;
-    let name = &rest[..rest.find('\'')?];
-    let valid = !name.is_empty()
-        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-        && !name.starts_with(|c: char| c.is_ascii_digit());
-    valid.then(|| name.to_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::function_name_from_repr;
-
-    #[test]
-    fn parses_function_repr() {
-        assert_eq!(
-            function_name_from_repr("<function 'slugify' at 0x6c>").as_deref(),
-            Some("slugify")
-        );
-        assert_eq!(function_name_from_repr("<function '<lambda>' at 0x6c>"), None);
-        assert_eq!(function_name_from_repr("'slugify'"), None);
-    }
 }

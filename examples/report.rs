@@ -4,7 +4,7 @@
 use std::error::Error;
 
 use minijinja::{Environment, context};
-use montyjinja::MontyJinja;
+use montyjinja::{MontyJinja, expand_python_tags};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut monty = MontyJinja::default();
@@ -14,7 +14,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut env = Environment::new();
-    env.add_template("report.md", include_str!("templates/report.md"))?;
+    // `{% python %}` blocks are expanded before MiniJinja parses the source.
+    let report = expand_python_tags(include_str!("templates/report.md"))?;
+    env.add_template_owned("report.md", report)?;
     env.add_template("card.md", include_str!("templates/card.md"))?;
     monty.install(&mut env);
 
