@@ -1,7 +1,7 @@
 //! Python modules registered as filters, tests and globals.
 
 use minijinja::{AutoEscape, Environment, context};
-use montyjinja::{Config, ExportKind, LoadError, MontyJinja, ResourceLimits};
+use montyjinja::{Config, ExportKind, LoadError, ModuleStrategy, MontyJinja, ResourceLimits};
 
 const FILTERS: &str = r#"
 @template_filter
@@ -27,7 +27,14 @@ def explode(x):
 "#;
 
 fn env_with(source: &str) -> Environment<'static> {
-    let mut monty = MontyJinja::default();
+    env_with_strategy(source, ModuleStrategy::default())
+}
+
+fn env_with_strategy(source: &str, module_strategy: ModuleStrategy) -> Environment<'static> {
+    let mut monty = MontyJinja::new(Config {
+        module_strategy,
+        ..Config::default()
+    });
     monty.add_module("filters.py", source).unwrap();
     let mut env = Environment::new();
     monty.install(&mut env);
@@ -255,5 +262,32 @@ fn renders_concurrently() {
             outputs.iter().all(|out| *out == format!("thread-{i}")),
             "{outputs:?}"
         );
+    }
+}
+
+#[test]
+fn strategies_behave_identically() {
+    let stateful = r#"
+TABLE = {i: i * i for i in range(100)}
+seen = []
+
+@template_global
+def square(i):
+    seen.append(i)
+    return (TABLE[i], len(seen))
+"#;
+    for strategy in [ModuleStrategy::Snapshot, ModuleStrategy::Reexecute] {
+        let env = env_with_strategy(FILTERS, strategy);
+        let out = env
+            .render_str("{{ 'A b'|slugify }} {{ 7 is prime }} {{ 0|explode }}", ())
+            .unwrap_err();
+        assert!(
+            out.to_string().contains("ZeroDivisionError"),
+            "{strategy:?}: {out}"
+        );
+
+        let env = env_with_strategy(stateful, strategy);
+        let out = env.render_str("{{ square(3) }} {{ square(9) }}", ()).unwrap();
+        assert_eq!(out, "[9, 1] [81, 1]", "{strategy:?}");
     }
 }

@@ -17,9 +17,10 @@ use minijinja::{Environment, Error, ErrorKind, State, Value};
 use monty::MontyRun;
 use monty_types::{CompileOptions, MontyObject};
 
+use crate::config::Config;
 use crate::convert::{from_monty, to_monty};
 use crate::error::PythonError;
-use crate::runtime::{self, Config, HOST_FUNCTIONS, NameResolution, Outcome, Script, SharedProgram};
+use crate::runtime::{Execution, HOST_FUNCTIONS, NameResolution, Script, SharedProgram};
 
 const SCRIPT: &str = "<template>";
 
@@ -27,6 +28,12 @@ const SCRIPT: &str = "<template>";
 /// are fixed at compile time). Template sources are finite, so the cache is
 /// bounded by the templates in use; it never needs eviction in practice.
 type Cache = Mutex<HashMap<(String, Vec<String>), Arc<SharedProgram>>>;
+
+/// Result of a completed snippet.
+struct Outcome {
+    value: MontyObject,
+    printed: String,
+}
 
 pub struct Inline {
     config: Config,
@@ -99,15 +106,14 @@ impl Inline {
             line_offset: 0,
             last_user_line: None,
         };
-        runtime::execute(
-            &program,
-            values,
-            &self.config,
-            Some(state),
-            NameResolution::TemplateContext,
-            script,
-        )
-        .map_err(|err| err.into_template_error("python snippet"))
+        let mut execution = Execution::new(&self.config, NameResolution::TemplateContext, script);
+        let value = execution
+            .run(&program, values, Some(state))
+            .map_err(|err| err.into_template_error("python snippet"))?;
+        Ok(Outcome {
+            value,
+            printed: execution.into_printed(),
+        })
     }
 
     fn compile(&self, source: &str, names: &[String]) -> Result<Arc<SharedProgram>, Error> {

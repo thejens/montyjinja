@@ -15,12 +15,13 @@ use std::sync::Arc;
 
 use minijinja::value::{Rest, ValueOrKwargs};
 use minijinja::{Environment, Error, State, Value};
-use monty::MontyRun;
-use monty_types::{CompileOptions, MontyObject, ObjectRef};
+use monty::{FunctionCall, MontyRun};
+use monty_types::{CompileOptions, ExcType, MontyException, MontyObject, ObjectRef};
 
+use crate::config::{Config, ModuleStrategy};
 use crate::convert::{from_monty, repr_text, to_monty};
 use crate::error::{LoadError, PythonError};
-use crate::runtime::{self, Config, HOST_FUNCTIONS, NameResolution, Script, SharedProgram};
+use crate::runtime::{Execution, HOST_FUNCTIONS, NameResolution, Script, SharedProgram, Stop};
 
 /// Defines the registration decorators. It must stay on ONE line: it is
 /// prepended to user source, and tracebacks are corrected by exactly
@@ -35,12 +36,15 @@ template_test = lambda a=None: __mj_dec__('test', a); \
 template_global = lambda a=None: __mj_dec__('global', a)\n";
 const PRELUDE_LINES: u32 = 1;
 
-/// The program's final expression doubles as discovery (kind `None` returns
-/// the registry) and dispatch (call the `index`-th export of `kind`), so one
-/// compiled program serves every export of the module.
-const DISPATCH: &str = "\n__mj_reg__ if __mj_kind__ is None else \
+/// After the module's top level, the program calls the `CHECKPOINT` host
+/// function with the registry and suspends. The host reads the exports from
+/// that call at load time; for each template call it resumes the checkpoint
+/// with `(kind, index, args, kwargs)` and the program dispatches. Pausing
+/// there is what lets a fully initialised module be snapshotted once and
+/// restored per call (see `ModuleStrategy`).
+const DISPATCH: &str = "\n__mj_kind__, __mj_index__, __mj_args__, __mj_kwargs__ = __mj_ready__(__mj_reg__)\n\
 __mj_reg__[__mj_kind__][__mj_index__][1](*__mj_args__, **__mj_kwargs__)\n";
-const DISPATCH_INPUTS: [&str; 4] = ["__mj_kind__", "__mj_index__", "__mj_args__", "__mj_kwargs__"];
+const CHECKPOINT: &str = "__mj_ready__";
 
 /// What a Python function is registered as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +92,11 @@ impl std::fmt::Debug for PythonModule {
 
 struct ModuleInner {
     script: String,
-    /// Line count of the user's source, to hide the dispatch frame.
+    /// Line count of the user's source, to hide the dispatch frames.
     source_lines: u32,
     program: SharedProgram,
+    /// The checkpoint call, serialized, under `ModuleStrategy::Snapshot`.
+    snapshot: Option<Vec<u8>>,
     config: Config,
     exports: Vec<Export>,
 }
@@ -100,10 +106,9 @@ impl PythonModule {
     /// and validates them.
     pub fn load(script: &str, source: &str, config: Config) -> Result<Self, LoadError> {
         let code = format!("{PRELUDE}{source}{DISPATCH}");
-        let inputs = DISPATCH_INPUTS
-            .iter()
-            .chain(HOST_FUNCTIONS.iter())
-            .map(|s| (*s).to_owned())
+        let inputs = std::iter::once(CHECKPOINT)
+            .chain(HOST_FUNCTIONS)
+            .map(str::to_owned)
             .collect();
         let program = MontyRun::new(code, script, inputs, CompileOptions::default())
             .map_err(|exc| LoadError::Python(PythonError::new(exc, script, PRELUDE_LINES)))?
@@ -113,13 +118,24 @@ impl PythonModule {
             script: script.to_owned(),
             source_lines: u32::try_from(source.lines().count()).unwrap_or(u32::MAX),
             program: SharedProgram::new(program),
+            snapshot: None,
             config,
             exports: Vec::new(),
         };
-        let registry = module
-            .invoke(None, MontyObject::none(), 0, Vec::new(), Vec::new())
+        let mut execution = module.execution();
+        let checkpoint = module
+            .run_to_checkpoint(&mut execution)
             .map_err(LoadError::Python)?;
-        module.exports = parse_registry(registry.as_ref())?;
+        let registry = checkpoint
+            .args
+            .arg(0)
+            .ok_or_else(|| LoadError::Invalid("checkpoint carried no registry".to_owned()))?;
+        module.exports = parse_registry(registry)?;
+        if module.config.module_strategy == ModuleStrategy::Snapshot {
+            let bytes = postcard::to_allocvec(&checkpoint)
+                .map_err(|err| LoadError::Invalid(format!("cannot snapshot module: {err}")))?;
+            module.snapshot = Some(bytes);
+        }
         Ok(Self {
             inner: Arc::new(module),
         })
@@ -161,50 +177,68 @@ impl PythonModule {
 }
 
 impl ModuleInner {
-    fn call(&self, state: &mut State<'_, '_>, export: &Export, args: &[Value]) -> Result<Value, Error> {
-        let args = split_kwargs(args)?;
-        let kind = MontyObject::string(export.kind.key());
-        let result = self
-            .invoke(Some(state), kind, export.index, args.positional, args.keyword)
-            .map_err(|err| {
-                err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
-            })?;
-        from_monty(result.as_ref())
-    }
-
-    fn invoke(
-        &self,
-        state: Option<&mut State<'_, '_>>,
-        kind: MontyObject,
-        index: usize,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-    ) -> Result<MontyObject, PythonError> {
-        let mut inputs = vec![
-            kind,
-            MontyObject::int(index as i64),
-            MontyObject::list(args),
-            MontyObject::dict(kwargs),
-        ];
-        inputs.extend(
-            HOST_FUNCTIONS
-                .iter()
-                .map(|name| MontyObject::function(*name, None)),
-        );
+    fn execution(&self) -> Execution<'_> {
         let script = Script {
             name: &self.script,
             line_offset: PRELUDE_LINES,
             last_user_line: Some(self.source_lines),
         };
-        runtime::execute(
-            &self.program,
-            inputs,
-            &self.config,
-            state,
-            NameResolution::Strict,
-            script,
-        )
-        .map(|outcome| outcome.value)
+        Execution::new(&self.config, NameResolution::Strict, script)
+    }
+
+    /// Runs the module's top level, without template access, up to the
+    /// dispatch checkpoint.
+    fn run_to_checkpoint(&self, execution: &mut Execution<'_>) -> Result<FunctionCall, PythonError> {
+        let inputs = std::iter::once(CHECKPOINT)
+            .chain(HOST_FUNCTIONS)
+            .map(|name| MontyObject::function(name, None))
+            .collect();
+        let progress = execution.start(&self.program, inputs)?;
+        match execution.drive(progress, None, Some(CHECKPOINT))? {
+            Stop::Checkpoint(call) => Ok(*call),
+            Stop::Complete(_) => Err(execution.fail(MontyException::new(
+                ExcType::RuntimeError,
+                Some("module finished without reaching its dispatch point".to_owned()),
+            ))),
+        }
+    }
+
+    fn call(&self, state: &mut State<'_, '_>, export: &Export, args: &[Value]) -> Result<Value, Error> {
+        let args = split_kwargs(args)?;
+        let result = self.invoke(state, export, args).map_err(|err| {
+            err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
+        })?;
+        from_monty(result.as_ref())
+    }
+
+    fn invoke(
+        &self,
+        state: &mut State<'_, '_>,
+        export: &Export,
+        args: PyArgs,
+    ) -> Result<MontyObject, PythonError> {
+        let mut execution = self.execution();
+        let checkpoint = match &self.snapshot {
+            // The bytes were produced by this process from a value of the
+            // same type, so decoding can only fail on a Monty bug.
+            Some(bytes) => postcard::from_bytes::<FunctionCall>(bytes)
+                .map_err(|err| execution.fail(MontyException::runtime_error(err)))?,
+            None => self.run_to_checkpoint(&mut execution)?,
+        };
+        // Each call gets the full time budget, regardless of how long the
+        // module's top level took when the snapshot was made.
+        checkpoint.tracker().on_feed_start();
+        let dispatch = MontyObject::tuple([
+            MontyObject::string(export.kind.key()),
+            MontyObject::int(i64::try_from(export.index).unwrap_or(i64::MAX)),
+            MontyObject::list(args.positional),
+            MontyObject::dict(args.keyword),
+        ]);
+        let progress = execution.resume(checkpoint, dispatch)?;
+        match execution.drive(progress, Some(state), None)? {
+            Stop::Complete(value) => Ok(value),
+            Stop::Checkpoint(_) => unreachable!("no checkpoint was requested"),
+        }
     }
 }
 

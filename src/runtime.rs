@@ -1,20 +1,22 @@
-//! Drives one sandboxed execution to completion, answering every suspension
-//! (host function calls, undefined-name lookups, OS calls) from the host.
+//! Drives sandboxed executions, answering every suspension (host function
+//! calls, undefined-name lookups, OS calls) from the host.
 //!
-//! Each execution clones a pre-compiled [`MontyRun`], so calls share no
-//! Python state: a filter cannot leak data from one render into another, and
-//! any number of threads can render concurrently without locking.
+//! Each execution starts from a private copy of a compiled program or
+//! snapshot, so calls share no Python state: a filter cannot leak data from
+//! one render into another, and any number of threads can render
+//! concurrently.
 
 use std::sync::{Mutex, PoisonError};
 
 use minijinja::value::Kwargs;
 use minijinja::{Error, State, Value};
-use monty::{MontyRun, RunProgress};
+use monty::{FunctionCall, MontyRun, RunProgress};
 use monty_types::{
-    CallArgs, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult, OsPolicy,
-    PrintWriter, ResourceLimits, ResourceTracker,
+    CallArgs, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult, PrintWriter,
+    ResourceTracker,
 };
 
+use crate::config::Config;
 use crate::convert::{from_monty, to_monty};
 use crate::error::PythonError;
 
@@ -42,37 +44,6 @@ impl SharedProgram {
     }
 }
 
-/// Sandbox limits applied to every Python invocation.
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Memory, time and recursion limits per invocation.
-    pub limits: ResourceLimits,
-    /// Clock, timezone, randomness and sleep behaviour inside the sandbox.
-    pub os_policy: OsPolicy,
-    /// Maximum bytes a single invocation may `print()`.
-    pub max_output_bytes: usize,
-    /// Maximum host round-trips (callbacks + name lookups) per invocation.
-    /// Monty stores but does not enforce `max_suspensions` for in-process
-    /// hosts, so this crate counts them itself.
-    pub max_host_calls: usize,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            limits: ResourceLimits {
-                max_memory: Some(32 * 1024 * 1024),
-                max_feed_duration: Some(std::time::Duration::from_millis(250)),
-                max_recursion_depth: 200,
-                ..ResourceLimits::default()
-            },
-            os_policy: OsPolicy::default(),
-            max_output_bytes: 1024 * 1024,
-            max_host_calls: 1_000,
-        }
-    }
-}
-
 /// How undefined Python names are answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameResolution {
@@ -84,12 +55,6 @@ pub enum NameResolution {
     TemplateContext,
 }
 
-/// Result of a completed invocation.
-pub struct Outcome {
-    pub value: MontyObject,
-    pub printed: String,
-}
-
 /// Where the code came from, for traceback rendering.
 #[derive(Clone, Copy)]
 pub struct Script<'a> {
@@ -99,94 +64,156 @@ pub struct Script<'a> {
     pub last_user_line: Option<u32>,
 }
 
-/// Runs `program` with `inputs` until it completes, serving suspensions.
-///
-/// `state` is `None` only while discovering a module's exports at load
-/// time, when there is no template to call back into.
-pub fn execute(
-    program: &SharedProgram,
-    inputs: Vec<MontyObject>,
-    config: &Config,
-    mut state: Option<&mut State<'_, '_>>,
+/// Why [`Execution::drive`] returned.
+pub enum Stop {
+    /// The program finished with this value.
+    Complete(MontyObject),
+    /// The program called the checkpoint function; the call is returned
+    /// unanswered so the host can resume (or snapshot) it.
+    Checkpoint(Box<FunctionCall>),
+}
+
+/// One invocation: collects `print()` output and counts host round-trips.
+pub struct Execution<'a> {
+    config: &'a Config,
     names: NameResolution,
-    script: Script<'_>,
-) -> Result<Outcome, PythonError> {
-    let fail = |exc| {
-        let err = PythonError::new(exc, script.name, script.line_offset);
-        match script.last_user_line {
+    script: Script<'a>,
+    printed: String,
+    host_calls: usize,
+}
+
+impl<'a> Execution<'a> {
+    pub fn new(config: &'a Config, names: NameResolution, script: Script<'a>) -> Self {
+        Self {
+            config,
+            names,
+            script,
+            printed: String::new(),
+            host_calls: 0,
+        }
+    }
+
+    /// Everything the invocation printed so far.
+    pub fn into_printed(self) -> String {
+        self.printed
+    }
+
+    pub fn fail(&self, exc: MontyException) -> PythonError {
+        let err = PythonError::new(exc, self.script.name, self.script.line_offset);
+        match self.script.last_user_line {
             Some(line) => err.hide_frames_after(line),
             None => err,
         }
-    };
-    let mut printed = String::new();
-    let cap = Some(config.max_output_bytes);
-    let tracker = ResourceTracker::new(config.limits.clone());
+    }
 
-    let mut progress = program
-        .fork()
-        .start(inputs, tracker, PrintWriter::CollectString(&mut printed, cap))
-        .map_err(fail)?;
-    let mut host_calls = 0usize;
+    fn writer(&mut self) -> PrintWriter<'_> {
+        PrintWriter::CollectString(&mut self.printed, Some(self.config.max_output_bytes))
+    }
 
-    loop {
-        if !matches!(progress, RunProgress::Complete(_)) {
-            host_calls += 1;
-        }
-        let over_budget = host_calls > config.max_host_calls;
-        let budget_exc = || {
-            MontyException::new(
+    /// Starts a fresh copy of `program`.
+    pub fn start(
+        &mut self,
+        program: &SharedProgram,
+        inputs: Vec<MontyObject>,
+    ) -> Result<RunProgress, PythonError> {
+        let tracker = ResourceTracker::new(self.config.limits.clone());
+        let program = program.fork();
+        let result = program.start(inputs, tracker, self.writer());
+        result.map_err(|exc| self.fail(exc))
+    }
+
+    /// Answers a suspended call — typically a restored checkpoint.
+    pub fn resume(&mut self, call: FunctionCall, value: MontyObject) -> Result<RunProgress, PythonError> {
+        let result = call.resume(value, self.writer());
+        result.map_err(|exc| self.fail(exc))
+    }
+
+    /// Serves suspensions until the program completes or calls `checkpoint`.
+    ///
+    /// `state` is `None` while a module's top level runs, which must not
+    /// depend on any particular template.
+    pub fn drive(
+        &mut self,
+        mut progress: RunProgress,
+        mut state: Option<&mut State<'_, '_>>,
+        checkpoint: Option<&str>,
+    ) -> Result<Stop, PythonError> {
+        loop {
+            let over_budget = !matches!(progress, RunProgress::Complete(_)) && {
+                self.host_calls += 1;
+                self.host_calls > self.config.max_host_calls
+            };
+            let budget_exc = MontyException::new(
                 ExcType::RuntimeError,
-                Some(format!("exceeded {} host calls", config.max_host_calls)),
-            )
-        };
-        let writer = PrintWriter::CollectString(&mut printed, cap);
+                Some(format!("exceeded {} host calls", self.config.max_host_calls)),
+            );
+            let names = self.names;
+            let writer = PrintWriter::CollectString(&mut self.printed, Some(self.config.max_output_bytes));
 
-        progress = match progress {
-            RunProgress::Complete(value) => return Ok(Outcome { value, printed }),
-            RunProgress::FunctionCall(call) if over_budget => call.abort(budget_exc(), writer),
-            RunProgress::FunctionCall(call) => {
-                let result = match state.as_deref_mut() {
-                    Some(state) => call_host(state, &call.function_name, &call.args),
-                    None => ExtFunctionResult::Error(MontyException::new(
-                        ExcType::RuntimeError,
-                        Some(format!(
-                            "{}() is only available while a template is rendering",
-                            call.function_name
+            let next = match progress {
+                RunProgress::Complete(value) => return Ok(Stop::Complete(value)),
+                RunProgress::FunctionCall(call) if Some(call.function_name.as_str()) == checkpoint => {
+                    return Ok(Stop::Checkpoint(Box::new(call)));
+                }
+                RunProgress::FunctionCall(call) if over_budget => call.abort(budget_exc, writer),
+                RunProgress::FunctionCall(call) => {
+                    let result = match state.as_deref_mut() {
+                        Some(state) => call_host(state, &call.function_name, &call.args),
+                        None => ExtFunctionResult::Error(MontyException::new(
+                            ExcType::RuntimeError,
+                            Some(format!(
+                                "{}() is only available while a template is rendering",
+                                call.function_name
+                            )),
                         )),
-                    )),
-                };
-                call.resume(result, writer)
-            }
-            RunProgress::NameLookup(lookup) if over_budget => lookup.abort(budget_exc(), writer),
-            RunProgress::NameLookup(lookup) => {
-                let result = match (names, state.as_deref()) {
-                    (NameResolution::TemplateContext, Some(state)) => {
-                        lookup_template_name(state, &lookup.name)
-                    }
-                    _ => NameLookupResult::Undefined,
-                };
-                lookup.resume(result, writer)
-            }
-            // The sandbox has no filesystem or environment; refuse rather
-            // than silently answering with fabricated data.
-            RunProgress::OsCall(call) => {
-                let exc = MontyException::new(
-                    ExcType::NotImplementedError,
-                    Some(format!("{:?} is not available in templates", call.function_call)),
-                );
-                call.resume(ExtFunctionResult::Error(exc), writer)
-            }
-            // Host functions answer synchronously, so the only way to reach
-            // this is `await` on something we never handed out.
-            RunProgress::ResolveFutures(futures) => futures.abort(
-                MontyException::new(
-                    ExcType::RuntimeError,
-                    Some("async code is not supported in templates".to_owned()),
+                    };
+                    call.resume(result, writer)
+                }
+                RunProgress::NameLookup(lookup) if over_budget => lookup.abort(budget_exc, writer),
+                RunProgress::NameLookup(lookup) => {
+                    let result = match (names, state.as_deref()) {
+                        (NameResolution::TemplateContext, Some(state)) => {
+                            lookup_template_name(state, &lookup.name)
+                        }
+                        _ => NameLookupResult::Undefined,
+                    };
+                    lookup.resume(result, writer)
+                }
+                // The sandbox has no filesystem or environment; refuse rather
+                // than silently answering with fabricated data.
+                RunProgress::OsCall(call) => {
+                    let exc = MontyException::new(
+                        ExcType::NotImplementedError,
+                        Some(format!("{:?} is not available in templates", call.function_call)),
+                    );
+                    call.resume(ExtFunctionResult::Error(exc), writer)
+                }
+                // Host functions answer synchronously, so the only way to
+                // reach this is `await` on something we never handed out.
+                RunProgress::ResolveFutures(futures) => futures.abort(
+                    MontyException::new(
+                        ExcType::RuntimeError,
+                        Some("async code is not supported in templates".to_owned()),
+                    ),
+                    writer,
                 ),
-                writer,
-            ),
+            };
+            progress = next.map_err(|exc| self.fail(exc))?;
         }
-        .map_err(fail)?;
+    }
+
+    /// Starts `program` and runs it to completion.
+    pub fn run(
+        &mut self,
+        program: &SharedProgram,
+        inputs: Vec<MontyObject>,
+        state: Option<&mut State<'_, '_>>,
+    ) -> Result<MontyObject, PythonError> {
+        let progress = self.start(program, inputs)?;
+        match self.drive(progress, state, None)? {
+            Stop::Complete(value) => Ok(value),
+            Stop::Checkpoint(_) => unreachable!("no checkpoint was requested"),
+        }
     }
 }
 

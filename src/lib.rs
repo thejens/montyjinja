@@ -35,6 +35,7 @@
 //! assert_eq!(out, "AL");
 //! ```
 
+mod config;
 mod convert;
 mod error;
 mod inline;
@@ -45,11 +46,11 @@ use std::sync::Arc;
 
 use minijinja::Environment;
 
+pub use config::{Config, ModuleStrategy};
 pub use convert::{from_monty, to_monty};
 pub use error::{LoadError, PythonError};
 pub use module::{Export, ExportKind, PythonModule};
 pub use monty_types::{OsPolicy, ResourceLimits};
-pub use runtime::Config;
 
 /// Collects Python modules and installs them, plus `py()` and `py_block`,
 /// into MiniJinja environments.
