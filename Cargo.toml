@@ -1,0 +1,19 @@
+[package]
+name = "montyjinja"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "Python-powered filters, tests, globals and inline blocks for MiniJinja, sandboxed by Monty"
+repository = "https://github.com/thejens/montyjinja"
+keywords = ["jinja", "templates", "python", "sandbox", "minijinja"]
+categories = ["template-engine"]
+publish = false
+
+[dependencies]
+minijinja = { version = "3.0.5", features = ["preserve_order"] }
+monty = "1.4.0"
+monty-types = "1.4.0"
+
+[profile.release]
+debug = false
