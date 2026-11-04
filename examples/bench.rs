@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use minijinja::{Environment, Value, context};
-use montyjinja::{Config, ModuleStrategy, MontyJinja};
+use montyjinja::{Config, Isolation, ModuleStrategy, MontyJinja};
 
 const ITEMS: usize = 1_000;
 const ROUNDS: u32 = 10;
@@ -30,9 +30,10 @@ def lookup(i):
     return TABLE[i % 2000]
 "#;
 
-fn env_for(strategy: ModuleStrategy) -> Environment<'static> {
+fn env_for(strategy: ModuleStrategy, isolation: Isolation) -> Environment<'static> {
     let mut monty = MontyJinja::new(Config {
         module_strategy: strategy,
+        isolation,
         ..Config::default()
     });
     monty.add_module("light.py", LIGHT).expect("light module loads");
@@ -53,8 +54,13 @@ fn main() {
     let rows: Vec<_> = (0..20).map(|i| context! { qty => i, price => 2.5 }).collect();
     let ctx = context! { titles, rows };
 
-    let snapshot = env_for(ModuleStrategy::Snapshot);
-    let reexecute = env_for(ModuleStrategy::Reexecute);
+    let configs = [
+        ("Snapshot", ModuleStrategy::Snapshot, Isolation::PerCall),
+        ("Reexecute", ModuleStrategy::Reexecute, Isolation::PerCall),
+        ("PerRender", ModuleStrategy::Snapshot, Isolation::PerRender),
+    ]
+    .map(|(label, strategy, isolation)| (label, env_for(strategy, isolation)));
+    let snapshot = &configs[0].1;
     let module_cases = [
         (
             "filter, light module",
@@ -76,22 +82,26 @@ fn main() {
     println!(
         "{:<36} {:>12}",
         "native rust filter",
-        time(&snapshot, native, &ctx)
+        time(snapshot, native, &ctx)
     );
     let inline = "{% for t in titles %}{{ py(\"'-'.join(t.lower().split())\") }}{% endfor %}";
     println!(
         "{:<36} {:>12}",
         "inline py() expression",
-        time(&snapshot, inline, &ctx)
+        time(snapshot, inline, &ctx)
     );
 
-    println!("\n{:<36} {:>12} {:>12}", "python module", "Snapshot", "Reexecute");
+    print!("\n{:<36}", "python module");
+    for (label, _) in &configs {
+        print!(" {label:>12}");
+    }
+    println!();
     for (name, source) in module_cases {
-        println!(
-            "{name:<36} {:>12} {:>12}",
-            time(&snapshot, source, &ctx),
-            time(&reexecute, source, &ctx)
-        );
+        print!("{name:<36}");
+        for (_, env) in &configs {
+            print!(" {:>12}", time(env, source, &ctx));
+        }
+        println!();
     }
 }
 

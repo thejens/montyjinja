@@ -19,6 +19,8 @@ pub struct Config {
     pub max_host_calls: usize,
     /// How a module's top level is made available to each call.
     pub module_strategy: ModuleStrategy,
+    /// How long module state lives: one call, or one render.
+    pub isolation: Isolation,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             max_output_bytes: 1024 * 1024,
             max_host_calls: 1_000,
             module_strategy: ModuleStrategy::default(),
+            isolation: Isolation::default(),
         }
     }
 }
@@ -55,4 +58,24 @@ pub enum ModuleStrategy {
     /// work the top level does (roughly 4µs for a module of plain `def`s).
     /// Best for modules that only define functions.
     Reexecute,
+}
+
+/// How long a module's Python state lives once a call has started from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// Every call starts from the pristine module state. A function can
+    /// never observe what an earlier call did.
+    #[default]
+    PerCall,
+    /// The first call in a render starts from the pristine state; later
+    /// calls in the same render continue from where the previous one left
+    /// off, and the state is dropped when the render ends. Nothing crosses
+    /// renders, but module globals mutated by one call are visible to the
+    /// next, and memory use accumulates against `max_memory` for the whole
+    /// render. A call that raises discards the state, so the next call
+    /// starts pristine again.
+    ///
+    /// Avoids restoring the module per call, which dominates the cost of
+    /// small functions.
+    PerRender,
 }

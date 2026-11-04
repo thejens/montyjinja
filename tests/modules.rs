@@ -1,7 +1,7 @@
 //! Python modules registered as filters, tests and globals.
 
 use minijinja::{AutoEscape, Environment, context};
-use montyjinja::{Config, ExportKind, LoadError, ModuleStrategy, MontyJinja, ResourceLimits};
+use montyjinja::{Config, ExportKind, Isolation, LoadError, ModuleStrategy, MontyJinja, ResourceLimits};
 
 const FILTERS: &str = r#"
 @template_filter
@@ -31,10 +31,17 @@ fn env_with(source: &str) -> Environment<'static> {
 }
 
 fn env_with_strategy(source: &str, module_strategy: ModuleStrategy) -> Environment<'static> {
-    let mut monty = MontyJinja::new(Config {
-        module_strategy,
-        ..Config::default()
-    });
+    env_with_config(
+        source,
+        Config {
+            module_strategy,
+            ..Config::default()
+        },
+    )
+}
+
+fn env_with_config(source: &str, config: Config) -> Environment<'static> {
+    let mut monty = MontyJinja::new(config);
     monty.add_module("filters.py", source).unwrap();
     let mut env = Environment::new();
     monty.install(&mut env);
@@ -290,4 +297,91 @@ def square(i):
         let out = env.render_str("{{ square(3) }} {{ square(9) }}", ()).unwrap();
         assert_eq!(out, "[9, 1] [81, 1]", "{strategy:?}");
     }
+}
+
+const COUNTER: &str = r#"
+seen = []
+
+@template_global
+def remember(x):
+    seen.append(x)
+    return len(seen)
+
+@template_filter
+def explode(x):
+    seen.append('poisoned')
+    raise ValueError(x)
+
+@template_filter
+def nested(x):
+    seen.append(x)
+    seen.append(x)
+    return apply_filter('nested_inner', x)
+
+@template_filter
+def nested_inner(x):
+    seen.append(x)
+    return len(seen)
+"#;
+
+/// A second module, so a call can fail inside `COUNTER` while the render
+/// carries on. `apply_filter` runs in the caller's render, unlike
+/// `render_string`, which starts a nested one.
+const CATCHER: &str = r#"
+@template_global
+def swallow(name):
+    try:
+        return apply_filter(name, 'boom')
+    except RuntimeError:
+        return 'caught'
+"#;
+
+fn per_render(strategy: ModuleStrategy) -> Environment<'static> {
+    let mut monty = MontyJinja::new(Config {
+        module_strategy: strategy,
+        isolation: Isolation::PerRender,
+        ..Config::default()
+    });
+    monty.add_module("counter.py", COUNTER).unwrap();
+    monty.add_module("catcher.py", CATCHER).unwrap();
+    let mut env = Environment::new();
+    monty.install(&mut env);
+    env.add_template("inner.html", "{{ remember(9) }}").unwrap();
+    env
+}
+
+#[test]
+fn per_render_state_lives_for_one_render() {
+    for strategy in [ModuleStrategy::Snapshot, ModuleStrategy::Reexecute] {
+        let env = per_render(strategy);
+        let tpl = "{{ remember(1) }}{{ remember(2) }}{% include 'inner.html' %}";
+        assert_eq!(env.render_str(tpl, ()).unwrap(), "123", "{strategy:?}");
+        assert_eq!(
+            env.render_str(tpl, ()).unwrap(),
+            "123",
+            "{strategy:?}: leaked across renders"
+        );
+    }
+}
+
+#[test]
+fn per_render_state_is_discarded_when_a_call_raises() {
+    let env = per_render(ModuleStrategy::Snapshot);
+    // `explode` takes the session built by the first two calls, mutates it
+    // and raises. The next call must start pristine, not from the session
+    // `explode` left half-modified.
+    let tpl = "{{ remember(1) }}{{ remember(2) }}{{ swallow('explode') }}{{ remember(3) }}";
+    assert_eq!(env.render_str(tpl, ()).unwrap(), "12caught1");
+}
+
+#[test]
+fn per_render_reentry_keeps_the_outer_session() {
+    let env = per_render(ModuleStrategy::Snapshot);
+    // `nested` holds the session (two appends) while `nested_inner` runs on
+    // a pristine one (one append). The outer session is stored last, so the
+    // next call sees three entries, not two.
+    let out = env
+        .render_str("{{ 'a'|nested }} {{ remember('b') }}", ())
+        .unwrap();
+    assert_eq!(out, "1 3");
 }

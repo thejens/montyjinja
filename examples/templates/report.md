@@ -14,11 +14,11 @@ Grand total: **{{ s.grand_total|money }}** · best region: **{{ s.best }}**
 
 {{ py("', '.join(f'{i}. {name}' for i, name in enumerate(s['ranking'], 1))") }}
 
-## Months above target (`py_block`)
+## Months above target (`{% raw %}{% python %}{% endraw %}`)
 
-{% call py_block(target=target) -%}
+{% python target=target -%}
 months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun']
 for region in regions:
     hits = [m for m, v in zip(months, region['monthly']) if v >= target]
     print(f"- {region['name']}: {', '.join(hits) or 'none'}")
-{%- endcall %}
+{%- endpython %}
