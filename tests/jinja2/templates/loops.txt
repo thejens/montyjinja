@@ -1,0 +1,5 @@
+{% for u in users %}{{ loop.index }}/{{ loop.length }} {{ u.name }}{{ ',' if not loop.last }}{% endfor %}
+{% for u in users if u.active %}{{ loop.cycle('odd', 'even') }}:{{ u.name }} {% endfor %}
+{% for x in range(10) %}{% if x == 6 %}{% break %}{% endif %}{% if x is odd %}{% continue %}{% endif %}{{ x }}{% endfor %}
+{% for x in [] %}never{% else %}empty{% endfor %}|{% for a, b in [(1, 2), (3, 4)] %}{{ a + b }} {% endfor %}
+{% for row in items %}{{ loop.revindex }}{{ loop.first }}{{ loop.previtem.name if loop.previtem }}{% endfor %}

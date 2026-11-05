@@ -25,6 +25,11 @@ pub struct Config {
     /// all modules. Once reached, further results are computed but not
     /// stored. `0` disables memoization.
     pub memo_capacity: usize,
+    /// Make templates written for Python Jinja2 render the same: Python
+    /// methods on values, Python-style printing and HTML escaping, and the
+    /// Jinja2 built-ins MiniJinja lacks. Replaces the environment's
+    /// formatter and unknown-method callback.
+    pub jinja2_compat: bool,
 }
 
 impl Default for Config {
@@ -42,6 +47,7 @@ impl Default for Config {
             module_strategy: ModuleStrategy::default(),
             isolation: Isolation::default(),
             memo_capacity: 1_024,
+            jinja2_compat: true,
         }
     }
 }
@@ -54,6 +60,10 @@ pub enum ModuleStrategy {
     /// and restore the snapshot for each call. Cost scales with the size of
     /// the module's heap (roughly 8µs empty, 40µs for a 2000-entry dict).
     /// Best when the top level computes tables, compiles regexes, etc.
+    ///
+    /// A module whose interpreter state cannot be snapshotted (Monty's
+    /// serialization does not cover everything, e.g. some imported modules)
+    /// falls back to `Reexecute` automatically.
     ///
     /// The default: its worst case is about 2x slower than `Reexecute`, while
     /// `Reexecute`'s worst case is unbounded.

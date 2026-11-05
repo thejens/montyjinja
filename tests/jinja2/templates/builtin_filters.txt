@@ -1,0 +1,8 @@
+{{ none_value|default('dflt') }}|{{ missing|default('m') }}|{{ ''|default('e', true) }}|{{ tags|join(', ') }}
+{{ users|map(attribute='name')|join('/') }}|{{ users|selectattr('active')|map(attribute='name')|list }}|{{ users|rejectattr('active')|first }}
+{{ items|sum(attribute='qty') }}|{{ users|sort(attribute='age')|map(attribute='name')|join }}|{{ totals|max }}|{{ totals|min }}
+{% for team, members in users|groupby('team') %}{{ team }}:{{ members|length }} {% endfor %}
+{{ 3.14159|round(2) }}|{{ 2.5|round }}|{{ '42'|int + 1 }}|{{ '2.5'|float }}|{{ -3|abs }}|{{ totals|first }}|{{ totals|last }}
+{{ [3, 1, 3, 2]|unique|list }}|{{ totals|reverse|list }}|{{ totals|batch(3)|list }}|{{ text|truncate(20) }}|{{ text|wordcount }}
+{{ '  x  '|trim }}|{{ 'hello world'|title }}|{{ 'hELLO'|capitalize }}|{{ 'a-b'|replace('-', '+') }}|{{ 'abc'|list }}
+{{ 42|string }}|{{ 'x'|center(5) }}|{{ "a\nb"|indent(2) }}|{{ items|map(attribute='price')|sum }}|{{ totals|length }}

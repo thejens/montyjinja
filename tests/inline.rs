@@ -80,7 +80,7 @@ fn py_block_output_is_escaped_unless_marked_safe() {
         .render(context! { name => "<x>" })
         .unwrap();
     let b = env.get_template("b.html").unwrap().render(()).unwrap();
-    assert_eq!(a, "&lt;i&gt;&lt;x&gt;&lt;&#x2f;i&gt;\n");
+    assert_eq!(a, "&lt;i&gt;&lt;x&gt;&lt;/i&gt;\n");
     assert_eq!(b, "<i>hi</i>\n");
 }
 

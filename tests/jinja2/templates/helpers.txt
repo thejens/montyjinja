@@ -1,0 +1,6 @@
+{% set row = cycler('odd', 'even') %}{% for t in tags %}{{ row.next() }}:{{ t }} {% endfor %}{{ row.current }}
+{% set comma = joiner(', ') %}{% for t in tags %}{{ comma() }}{{ t }}{% endfor %}|{% set bar = joiner() %}{{ bar() }}{{ bar() }}
+{{ 1|filesizeformat }}|{{ 999|filesizeformat }}|{{ 123456789|filesizeformat }}|{{ 123456789|filesizeformat(true) }}
+{{ '<p>Hi <b>there</b> &amp; <!-- note -->bye</p>'|striptags }}|{{ 'mid'|center(9) }}|{{ text|truncate(10, true) }}
+{{ totals|evens|list }}|{% for v in totals|evens %}{{ v }};{% endfor %}|{{ user.items() }}|{{ user.keys() }}
+{{ range(3) }}|{{ user.items()|list|length }}|{{ (user.items()|list)[0] }}|{{ text.split()|sort|first }}

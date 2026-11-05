@@ -1,0 +1,5 @@
+ADA LOVELACE|Ada Lovelace|ada|Hello big world
+True|False|padded|3
+rust-python-jinja|True|42|3|4
+ada|ecalevol ada|lace|***x***|007
+['The', 'quick', 'brown fox jumps over the lazy dog']|('a', ',', 'b,c')|ADA LOVELACE

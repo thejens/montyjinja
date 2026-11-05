@@ -1,0 +1,3 @@
+{{ price|money }}|{{ price|money('USD') }}|{{ title|slugify }}|{{ name|initials }}|{{ 'hey'|shout(times=2) }}
+{{ 11 is prime }}|{% set s = stats(totals) %}{{ s.n }}/{{ s.total }}/{{ s.mean }}|{{ SITE }}|{{ LIMITS.min }}
+{{ items|map(attribute='price')|map('money', 'USD')|join(', ') }}

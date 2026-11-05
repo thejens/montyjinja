@@ -1,0 +1,6 @@
+{% macro tag(name, cls='x', attrs={}) -%}
+<{{ name }} class="{{ cls }}"{% for k, v in attrs|dictsort %} {{ k }}="{{ v }}"{% endfor %}>{{ caller() if caller else '' }}</{{ name }}>
+{%- endmacro %}
+{{ tag('p') }}|{{ tag('a', cls='link', attrs={'href': '/', 'id': 'home'}) }}
+{% call tag('div') %}inner {{ user.name }}{% endcall %}
+{% macro row(cells) %}{{ cells|join(' | ') }}{% endmacro %}{{ row(['a', 'b']) }}
