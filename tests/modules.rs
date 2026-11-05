@@ -244,7 +244,7 @@ fn results_follow_autoescaping() {
     env.set_auto_escape_callback(|_| AutoEscape::Html);
     env.add_template("t.html", "{{ 'a'|bold }}").unwrap();
     let out = env.get_template("t.html").unwrap().render(()).unwrap();
-    assert_eq!(out, "&lt;b&gt;a&lt;&#x2f;b&gt;");
+    assert_eq!(out, "&lt;b&gt;a&lt;/b&gt;");
 }
 
 #[test]
@@ -295,7 +295,7 @@ def square(i):
 
         let env = env_with_strategy(stateful, strategy);
         let out = env.render_str("{{ square(3) }} {{ square(9) }}", ()).unwrap();
-        assert_eq!(out, "[9, 1] [81, 1]", "{strategy:?}");
+        assert_eq!(out, "(9, 1) (81, 1)", "{strategy:?}");
     }
 }
 
@@ -384,4 +384,13 @@ fn per_render_reentry_keeps_the_outer_session() {
         .render_str("{{ 'a'|nested }} {{ remember('b') }}", ())
         .unwrap();
     assert_eq!(out, "1 3");
+}
+
+#[test]
+fn modules_that_cannot_be_snapshotted_fall_back_to_reexecution() {
+    // Monty's serialized state for an imported `re` does not read back, so
+    // this module is re-run per call even under the default `Snapshot`.
+    let env =
+        env_with("import re\n\n@template_filter\ndef words(s):\n    return len(re.findall(r'\\w+', s))\n");
+    assert_eq!(env.render_str("{{ 'a b c'|words }}", ()).unwrap(), "3");
 }

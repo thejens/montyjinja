@@ -1,0 +1,5 @@
+1/4 ada,2/4 bob,3/4 cy,4/4 dee
+odd:ada even:cy odd:dee 
+024
+empty|3 7 
+3True2Falsebolt1Falsenut

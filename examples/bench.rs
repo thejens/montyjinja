@@ -98,6 +98,12 @@ fn main() {
         "inline py() expression",
         time(snapshot, inline, &ctx)
     );
+    let method = "{% for t in titles %}{{ '-'.join(t.lower().split()) }}{% endfor %}";
+    println!(
+        "{:<36} {:>12}",
+        "python methods (3 calls)",
+        time(snapshot, method, &ctx)
+    );
 
     print!("\n{:<36}", "python module");
     for (label, _) in &configs {

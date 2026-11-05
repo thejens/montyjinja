@@ -30,12 +30,12 @@ const SCRIPT: &str = "<template>";
 type Cache = Mutex<HashMap<(String, Vec<String>), Arc<SharedProgram>>>;
 
 /// Result of a completed snippet.
-struct Outcome {
-    value: MontyObject,
-    printed: String,
+pub(crate) struct Outcome {
+    pub(crate) value: MontyObject,
+    pub(crate) printed: String,
 }
 
-pub struct Inline {
+pub(crate) struct Inline {
     config: Config,
     cache: Cache,
 }
@@ -94,6 +94,21 @@ impl Inline {
         source: &str,
         inputs: Vec<(String, MontyObject)>,
     ) -> Result<Outcome, Error> {
+        self.evaluate(state, source, inputs, NameResolution::TemplateContext)
+            .map_err(|err| err.into_template_error("python snippet"))
+    }
+
+    /// Compiles (or reuses) `source` and runs it with `inputs` bound as
+    /// globals. Also the engine behind the Jinja2 compatibility layer, which
+    /// passes `NameResolution::Strict` because its snippets are fixed code
+    /// that must not pick up template variables.
+    pub(crate) fn evaluate(
+        &self,
+        state: &mut State<'_, '_>,
+        source: &str,
+        inputs: Vec<(String, MontyObject)>,
+        resolution: NameResolution,
+    ) -> Result<Outcome, PythonError> {
         let (names, mut values): (Vec<String>, Vec<MontyObject>) = inputs.into_iter().unzip();
         let program = self.compile(source, &names)?;
         values.extend(
@@ -106,17 +121,15 @@ impl Inline {
             line_offset: 0,
             last_user_line: None,
         };
-        let mut execution = Execution::new(&self.config, NameResolution::TemplateContext, script);
-        let value = execution
-            .run(&program, values, Some(state))
-            .map_err(|err| err.into_template_error("python snippet"))?;
+        let mut execution = Execution::new(&self.config, resolution, script);
+        let value = execution.run(&program, values, Some(state))?;
         Ok(Outcome {
             value,
             printed: execution.into_printed(),
         })
     }
 
-    fn compile(&self, source: &str, names: &[String]) -> Result<Arc<SharedProgram>, Error> {
+    fn compile(&self, source: &str, names: &[String]) -> Result<Arc<SharedProgram>, PythonError> {
         let key = (source.to_owned(), names.to_vec());
         if let Some(program) = self.cache.lock().expect("cache poisoned").get(&key) {
             return Ok(Arc::clone(program));
@@ -127,7 +140,7 @@ impl Inline {
             .chain(HOST_FUNCTIONS.iter().map(|s| (*s).to_owned()))
             .collect();
         let program = MontyRun::new(source.to_owned(), SCRIPT, inputs, CompileOptions::default())
-            .map_err(|exc| PythonError::new(exc, SCRIPT, 0).into_template_error("python snippet"))?
+            .map_err(|exc| PythonError::new(exc, SCRIPT, 0))?
             .with_os_policy(self.config.os_policy.clone());
         let program = Arc::new(SharedProgram::new(program));
         self.cache

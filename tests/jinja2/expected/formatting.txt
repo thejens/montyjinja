@@ -1,0 +1,3 @@
+1,234.50|Ada has 3 tags|   right|left  |
+widget costs 1234.50|x-00042| 25.6%
+Ada is 36|25.6%|0003.142

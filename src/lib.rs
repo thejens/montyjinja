@@ -16,6 +16,12 @@
 //!    has no custom tags, so the source is expanded into a `py_block` call
 //!    first, with [`expand_python_tags`] or [`python_tag_loader`].
 //!
+//! With [`Config::jinja2_compat`] (the default), templates written for
+//! Python's Jinja2 render the same: Python methods on values
+//! (`{{ name.title() }}`), Python-style printing and HTML escaping, and the
+//! Jinja2 built-ins MiniJinja lacks. Modules can also register Jinja2-style,
+//! with `env.filters['name'] = fn`.
+//!
 //! Python code can call back into the template engine with `render(name,
 //! **ctx)`, `render_string(source, **ctx)` and `apply_filter(name, value,
 //! *args, **kwargs)`.
@@ -41,6 +47,7 @@ mod config;
 mod convert;
 mod error;
 mod inline;
+mod jinja2;
 mod module;
 mod runtime;
 mod tags;
@@ -58,18 +65,32 @@ pub use tags::{expand_python_tags, python_tag_loader};
 
 /// Collects Python modules and installs them, plus `py()` and `py_block`,
 /// into MiniJinja environments.
-#[derive(Default)]
 pub struct MontyJinja {
     config: Config,
     modules: Vec<PythonModule>,
+    /// Jinja2's Python-implemented built-ins, when `jinja2_compat` is on.
+    jinja2_builtins: Option<PythonModule>,
+}
+
+impl Default for MontyJinja {
+    fn default() -> Self {
+        Self::new(Config::default())
+    }
 }
 
 impl MontyJinja {
     /// Uses `config` for every module added afterwards and for inline code.
     pub fn new(config: Config) -> Self {
+        let jinja2_builtins = config.jinja2_compat.then(|| {
+            // Fixed source under this crate's tests; loading it can only
+            // fail if Monty itself regresses.
+            PythonModule::load(jinja2::BUILTINS_SCRIPT, jinja2::BUILTINS, config.clone())
+                .expect("the bundled Jinja2 built-ins module loads")
+        });
         Self {
             config,
             modules: Vec::new(),
+            jinja2_builtins,
         }
     }
 
@@ -87,13 +108,20 @@ impl MontyJinja {
         &self.modules
     }
 
-    /// Registers all module exports plus the `py` and `py_block` globals.
-    /// Later modules override earlier ones on name clashes, as MiniJinja's
-    /// own registration does.
+    /// Registers all module exports plus the `py` and `py_block` globals,
+    /// and, with `Config::jinja2_compat`, the Jinja2 compatibility layer.
+    /// User modules are installed last, so their exports override built-ins;
+    /// later modules override earlier ones, as MiniJinja's own registration
+    /// does.
     pub fn install(&self, env: &mut Environment<'_>) {
+        let inline = Arc::new(inline::Inline::new(self.config.clone()));
+        if let Some(builtins) = &self.jinja2_builtins {
+            jinja2::install(env, &inline);
+            builtins.install(env);
+        }
         for module in &self.modules {
             module.install(env);
         }
-        Arc::new(inline::Inline::new(self.config.clone())).install(env);
+        inline.install(env);
     }
 }

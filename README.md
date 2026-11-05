@@ -1,18 +1,23 @@
-# montyjinja: Python filters and inline Python for MiniJinja
+# montyjinja: run Python Jinja2 templates on MiniJinja, with filters in Python
 
 [![CI](https://github.com/thejens/montyjinja/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/montyjinja/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)
 
-**Write [MiniJinja](https://github.com/mitsuhiko/minijinja) template filters, tests, global functions and inline
-code blocks in Python, from Rust.** The Python runs in-process in [Monty](https://github.com/pydantic/monty),
-Pydantic's sandboxed Python interpreter written in Rust. You get Jinja2-style Python extensibility for Rust
-templating without embedding CPython, pyo3, subprocesses or WebAssembly, and every call runs under memory, time
-and recursion limits.
+**Render templates written for Python's Jinja2 from Rust, and write their filters, tests and globals in
+Python.** montyjinja extends [MiniJinja](https://github.com/mitsuhiko/minijinja) with Python semantics:
+`{{ name.title() }}`, `{{ "{:,.2f}".format(total) }}` and `{% for k, v in d.items() %}` work as in Jinja2, and a
+`filters.py` that registers `env.filters['money'] = money` loads unchanged. The Python runs in-process in
+[Monty](https://github.com/pydantic/monty), Pydantic's sandboxed Python interpreter written in Rust: no CPython,
+pyo3, subprocesses or WebAssembly, and every call runs under memory, time and recursion limits.
 
 > **Status:** a working proof of concept with tests, benchmarks and CI. It is not published to crates.io.
 
 ```jinja
+{# plain Jinja2, as written for Python: methods on values behave like Python's #}
+{{ user.name.title() }} spent {{ "{:,.2f}".format(total) }}
+{% for key, value in settings.items() %}{{ key }}={{ value }}{{ ", " if not loop.last }}{% endfor %}
+
 {# filters, tests and globals written in Python #}
 {{ amount|money('USD') }}  {{ series|sparkline }}  {% if total is outlier(totals) %}⚠{% endif %}
 
@@ -32,6 +37,7 @@ for region in regions:
 - [Why montyjinja?](#why-montyjinja)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Jinja2 compatibility](#jinja2-compatibility)
 - [Features](#features)
 - [Performance](#performance)
 - [How it works](#how-it-works)
@@ -55,8 +61,10 @@ functions compiled into the host. That causes problems montyjinja addresses:
   workarounds.
 - **Embedding CPython is heavy and unsandboxed.** Monty is pure Rust and runs in-process with no filesystem,
   environment or network access, plus per-call resource limits.
-- **Porting from Python Jinja2 loses your filters.** Simple Jinja2 Python filters run unchanged, as long as they
-  stay within Monty's Python subset.
+- **Jinja2 templates don't port as-is.** MiniJinja doesn't run Python methods (`.upper()`, `.format()`,
+  `.items()`), prints and escapes values differently, and lacks some built-in filters. montyjinja closes those
+  gaps, and a Jinja2 `filters.py` that registers into `env.filters` loads unchanged, as long as it stays within
+  Monty's Python subset.
 
 ## Installation
 
@@ -110,6 +118,41 @@ let monty = MontyJinja::new(Config { isolation: Isolation::PerRender, ..Config::
 See [`examples/report.rs`](examples/report.rs), [`examples/python/report.py`](examples/python/report.py) and
 [`examples/templates/report.md`](examples/templates/report.md) for a fuller demo (`make example`).
 
+## Jinja2 compatibility
+
+With the default `Config::jinja2_compat`, templates written for Python's Jinja2 render the same under MiniJinja.
+A conformance suite checks this: [16 templates](tests/jinja2/templates) are rendered by real Jinja2 3.1 into
+[golden files](tests/jinja2/expected) (`make golden`), and montyjinja must reproduce them byte for byte.
+They share one [`filters.py`](tests/jinja2/filters.py) that registers its filters the Jinja2 way and runs under both
+engines.
+
+| Jinja2 behaviour                                      | How montyjinja provides it                                                   |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Python methods on values: `s.upper()`, `"{:>8}".format(x)`, `d.items()`, `s.split(',', 1)` | MiniJinja's unknown-method callback runs the method in Monty on a copy of the value |
+| Dict views, `range` and generators: loop over them, print them as `dict_items([...])` and `range(0, 3)` | Python iterables become sequences that keep their Python `repr` |
+| `env.filters['x'] = f`, `env.tests[...]`, `env.globals[...]` (including plain values) | An `env` object in every module's prelude |
+| `\|format` with printf semantics (`"%(a)s-%(b)05d"\|format(a='x', b=42)`) | Python's own `%` operator |
+| Output as Python's `str()`: `None`, `1e+20`, `('a', 1)`, `{'k': [1.5]}` | A formatter implementing Python's `repr`, including CPython's float rules |
+| HTML escaping as MarkupSafe does it (`&#39;`, `&#34;`, `/` left alone) | The formatter, plus `escape`, `e`, `forceescape` and `xmlattr` filters |
+| `truncate`, `wordcount`, `center`, `filesizeformat`, `striptags`, `random` | A bundled Python module ([`builtins.py`](src/jinja2/builtins.py)) |
+| `cycler`, `joiner`, `{% break %}`, `{% continue %}`, `{% do %}` | Native objects and MiniJinja's `loop_controls` feature |
+
+What still differs, because MiniJinja has no extension point for it:
+
+- **`%` on strings.** `{{ "%.2f" % x }}` fails; MiniJinja's `%` is numeric only. Use `{{ "%.2f"|format(x) }}`.
+- **In-place mutation.** `{% do items.append(x) %}` raises an error instead of silently doing nothing, because
+  MiniJinja values are immutable. Build a new value (`items + [x]`) or use `namespace()`.
+- **Methods on host objects.** Only plain data (strings, numbers, lists, dicts) has Python methods. Rust objects
+  in the context keep MiniJinja's behaviour, and Python class instances returned by filters arrive as dicts of
+  their attributes, without their methods.
+- **Jinja2's Python API.** `pass_context`/`pass_environment` decorators, `Markup` objects in Python code, and
+  extensions such as i18n `{% trans %}` have no equivalent.
+- **Not yet implemented:** `wordwrap`, `urlize`, `lipsum` and the `callable` test. `striptags` decodes numeric and
+  basic named entities only, since Monty has no `html.unescape`.
+
+Turning compatibility on replaces the environment's formatter and unknown-method callback. Set
+`Config { jinja2_compat: false, .. }` to keep MiniJinja's own behaviour.
+
 ## Features
 
 **Yes, it works, and it is cheap enough to use for real.** Python adds expressiveness to MiniJinja that Jinja's
@@ -118,7 +161,8 @@ them unsandboxed code execution.
 
 | What you get                                                        | How                                                           |
 | ------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Python filters / tests / globals                                    | `@template_filter`, `@template_test`, `@template_global`      |
+| Jinja2 templates render as in Python                                | See [Jinja2 compatibility](#jinja2-compatibility)             |
+| Python filters / tests / globals                                    | `@template_filter`, `@template_test`, `@template_global`, or Jinja2's `env.filters[...]` |
 | Inline Python expressions                                           | `{{ py("...") }}`                                             |
 | Inline Python blocks                                                | `{% python %}...{% endpython %}`, expanded to a `py_block` call before parsing |
 | Template variables visible in inline Python without passing them   | Monty's `NameLookup` suspension resolves names from `State`   |
@@ -141,6 +185,7 @@ the ratios are stable.
 | --------------------------------------------- | -----------------: | --------: | --------: |
 | native Rust filter (baseline)                 |          ~0.5 µs   |           |           |
 | inline `py("'-'.join(t.lower().split())")`    |            ~5 µs   |           |           |
+| the same as Jinja2 methods, `'-'.join(t.lower().split())` (3 calls) | ~20 µs |    |           |
 | Python module filter, module with only `def`s |           ~16 µs   |    ~12 µs |     ~4 µs |
 | … same, with a 20-row list of dicts argument  |           ~47 µs   |    ~36 µs |    ~28 µs |
 | Python module filter, module builds a 2000-entry table at top level |  ~165 µs   |   ~590 µs |   ~3.5 µs |
@@ -218,7 +263,7 @@ Where the time goes:
 | none / undefined                 | `None`                     | none                                    |
 | bool, int, float                 | `bool`, `int`, `float`     | same (ints beyond i64 via i128 or string) |
 | string (safe marker dropped)     | `str`                      | string (not safe; it gets autoescaped)  |
-| seq / iterable                   | `list`                     | seq (tuples, sets and namedtuples too)  |
+| seq / iterable (tuples stay `tuple`) | `list`                 | seq; tuples stay tuples; sets, dict views, ranges and generators become sequences that print as Python does |
 | map                              | `dict` (order kept)        | map, order kept (`preserve_order`)      |
 | other objects                    | `str(value)`               | class/dataclass instances → map; decimals → string; else `repr()` |
 
@@ -282,10 +327,18 @@ pyo3 embeds CPython: the full language and its packages, but with no sandbox, a 
 CPython's global interpreter lock. Monty implements a subset of Python in pure Rust, with no third-party packages,
 but it is sandboxed by design, starts in microseconds and renders on many threads at once.
 
+### Can I render my existing Jinja2 templates from Rust?
+
+Usually, yes. Python methods, `|format`, value printing, HTML escaping and the missing built-in filters behave as
+in Jinja2, and a conformance suite checks this against real Jinja2. The exceptions are `"..." % x` on strings,
+in-place mutation such as `items.append(x)`, and Jinja2's Python API. See
+[Jinja2 compatibility](#jinja2-compatibility).
+
 ### Can I reuse Python Jinja2 filters?
 
-Often, yes. A Jinja2 filter that is a plain function and avoids third-party imports usually works unchanged
-under `@template_filter`. Filters that rely on Jinja2's Python API (`Markup`, `pass_context`) need adapting.
+Often, yes. A module that registers its filters with `env.filters['name'] = fn` (or `env.tests`,
+`env.globals`) loads unchanged, as long as its functions avoid third-party imports. Filters that rely on Jinja2's
+Python API (`Markup`, `pass_context`) need adapting.
 
 ### Is it fast enough?
 
@@ -299,6 +352,7 @@ in milliseconds. See [Performance](#performance).
 make help      # list targets
 make check     # fmt-check + clippy -D warnings + tests
 make example   # render the demo report
+make golden    # regenerate Jinja2 conformance outputs (needs uv)
 make bench     # performance table above
 ```
 

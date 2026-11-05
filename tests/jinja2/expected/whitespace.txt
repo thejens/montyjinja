@@ -1,0 +1,6 @@
+<ul>
+  <li>rust</li>
+  <li>python</li>
+  <li>jinja</li>
+</ul>
+trimmed

@@ -1,0 +1,3 @@
+{{ "{:,.2f}".format(price) }}|{{ "{0} has {1} tags".format(user.name, tags|length) }}|{{ "{:>8}|{:<6}|".format('right', 'left') }}
+{{ "%s costs %.2f"|format(item, price) }}|{{ "%(a)s-%(b)05d"|format(a='x', b=42) }}|{{ "%5.1f%%"|format(ratio * 100) }}
+{{ "{name} is {age}".format(**user) }}|{{ "{:.1%}".format(ratio) }}|{{ "{:08.3f}".format(3.14159) }}

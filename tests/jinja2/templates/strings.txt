@@ -1,0 +1,5 @@
+{{ name.upper() }}|{{ name.title() }}|{{ name.split()[0] }}|{{ title.replace('-', ' ').capitalize() }}
+{{ path.startswith('/') }}|{{ path.endswith('.html') }}|{{ ' padded '.strip() }}|{{ csv.split(',')|length }}
+{{ '-'.join(tags) }}|{{ code.isdigit() }}|{{ code.lstrip('0') }}|{{ name.count('a') }}|{{ name.find('love') }}
+{{ name[:3] }}|{{ name[::-1] }}|{{ name[-4:] }}|{{ 'x'.center(7, '*') }}|{{ '7'.zfill(3) }}
+{{ text.split(' ', 2) }}|{{ csv.partition(',') }}|{{ name.swapcase() }}

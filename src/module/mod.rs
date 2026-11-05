@@ -23,7 +23,7 @@ use monty::{FunctionCall, MontyRun};
 use monty_types::{CompileOptions, ExcType, MontyException, MontyObject};
 
 use crate::config::{Config, Isolation, ModuleStrategy};
-use crate::convert::{from_monty, to_monty};
+use crate::convert::{PY_VIEW_HELPER, PyArgs, from_monty_result, split_kwargs};
 use crate::error::{LoadError, PythonError};
 use crate::runtime::{Execution, HOST_FUNCTIONS, NameResolution, Script, SharedProgram, Stop};
 pub use registry::{Export, ExportKind};
@@ -40,10 +40,13 @@ use registry::{PRELUDE, PRELUDE_LINES, parse_registry};
 /// initialised module can be snapshotted once and restored per call (see
 /// `ModuleStrategy`), or kept suspended and resumed again by the next call
 /// in the same render (see `Isolation::PerRender`).
-const DISPATCH: &str = "\n__mj_out__ = __mj_reg__\n\
+const DISPATCH: &str = "\nfor __mj_kind__, __mj_entries__ in (('filter', __mj_env__.filters), ('test', __mj_env__.tests), ('global', __mj_env__.globals)):\n    \
+for __mj_name__, __mj_value__ in __mj_entries__.items():\n        \
+__mj_reg__[__mj_kind__].append((__mj_name__, __mj_value__, False))\n\
+__mj_out__ = __mj_reg__\n\
 while True:\n    \
 __mj_kind__, __mj_index__, __mj_args__, __mj_kwargs__ = __mj_ready__(__mj_out__)\n    \
-__mj_out__ = __mj_reg__[__mj_kind__][__mj_index__][1](*__mj_args__, **__mj_kwargs__)\n";
+__mj_out__ = __mj_view__(__mj_reg__[__mj_kind__][__mj_index__][1](*__mj_args__, **__mj_kwargs__))\n";
 const CHECKPOINT: &str = "__mj_ready__";
 
 /// Suspended module programs kept for the rest of a render under
@@ -84,7 +87,7 @@ impl PythonModule {
     /// Compiles `source`, runs its top level once to collect registrations,
     /// and validates them.
     pub fn load(script: &str, source: &str, config: Config) -> Result<Self, LoadError> {
-        let code = format!("{PRELUDE}{source}{DISPATCH}");
+        let code = format!("{PY_VIEW_HELPER}{PRELUDE}{source}{DISPATCH}");
         let inputs = std::iter::once(CHECKPOINT)
             .chain(HOST_FUNCTIONS)
             .map(str::to_owned)
@@ -111,9 +114,14 @@ impl PythonModule {
             .ok_or_else(|| LoadError::Invalid("checkpoint carried no registry".to_owned()))?;
         module.exports = parse_registry(registry)?;
         if module.config.module_strategy == ModuleStrategy::Snapshot {
-            let bytes = postcard::to_allocvec(&checkpoint)
-                .map_err(|err| LoadError::Invalid(format!("cannot snapshot module: {err}")))?;
-            module.snapshot = Some(bytes);
+            // Some interpreter state serializes but cannot be read back
+            // (postcard does not support every serde construct Monty uses,
+            // e.g. for imported modules). Such a module silently falls back
+            // to re-running its top level per call, which `invoke` does
+            // whenever there is no snapshot.
+            module.snapshot = postcard::to_allocvec(&checkpoint)
+                .ok()
+                .filter(|bytes| postcard::from_bytes::<FunctionCall>(bytes).is_ok());
         }
         Ok(Self {
             inner: Arc::new(module),
@@ -141,6 +149,9 @@ impl PythonModule {
                     env.add_function(name, move |state: &mut State, args: Rest<ValueOrKwargs>| {
                         module.call(state, &export, &args.into_values())
                     })
+                }
+                ExportKind::Constant => {
+                    env.add_global(name, export.constant.clone().unwrap_or_default());
                 }
                 ExportKind::Test => env.add_test(
                     name,
@@ -208,7 +219,7 @@ impl ModuleInner {
         let checkpoint = self.invoke(state, export, args).map_err(|err| {
             err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
         })?;
-        let result = checkpoint.args.arg(0).map(from_monty).transpose()?;
+        let result = checkpoint.args.arg(0).map(from_monty_result).transpose()?;
         if self.config.isolation == Isolation::PerRender {
             state
                 .get_or_insert_extension_with(Sessions::default)
@@ -262,31 +273,4 @@ impl ModuleInner {
         let stop = execution.drive(progress, Some(state), Some(CHECKPOINT))?;
         Self::next_checkpoint(&mut execution, stop)
     }
-}
-
-/// Python call arguments converted from a MiniJinja call.
-struct PyArgs {
-    positional: Vec<MontyObject>,
-    keyword: Vec<(MontyObject, MontyObject)>,
-}
-
-/// Converts MiniJinja call arguments into Python positional and keyword
-/// arguments. MiniJinja passes keyword arguments as a trailing map value.
-fn split_kwargs(args: &[Value]) -> Result<PyArgs, Error> {
-    let (positional, kwargs) = match args.split_last() {
-        Some((last, rest)) if last.is_kwargs() => (rest, Some(last)),
-        _ => (args, None),
-    };
-    let positional = positional.iter().map(to_monty).collect::<Result<_, _>>()?;
-    let mut pairs = Vec::new();
-    if let Some(kwargs) = kwargs {
-        for key in kwargs.try_iter()? {
-            let value = kwargs.get_item(&key)?;
-            pairs.push((to_monty(&key)?, to_monty(&value)?));
-        }
-    }
-    Ok(PyArgs {
-        positional,
-        keyword: pairs,
-    })
 }

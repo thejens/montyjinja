@@ -13,7 +13,8 @@ categories = ["template-engine"]
 publish = false
 
 [dependencies]
-minijinja = { version = "3.0.5", features = ["preserve_order"] }
+# `loop_controls`: Jinja2 templates commonly use {% break %} / {% continue %}.
+minijinja = { version = "3.0.5", features = ["preserve_order", "loop_controls"] }
 monty = "1.4.0"
 monty-types = "1.4.0"
 # Snapshots of initialised modules; Monty serializes its own state with it too.
@@ -21,3 +22,8 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 [profile.release]
 debug = false
+
+[dev-dependencies]
+# `serde`: the conformance test loads its context from JSON.
+minijinja = { version = "3.0.5", features = ["serde"] }
+serde_json = { version = "1", features = ["preserve_order"] }

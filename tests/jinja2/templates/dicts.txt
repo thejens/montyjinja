@@ -1,0 +1,3 @@
+{% for k, v in user.items() %}{{ k }}={{ v }};{% endfor %}
+{{ user.get('missing', 'n/a') }}|{{ user.get('name') }}|{{ user.keys()|list }}|{{ user.values()|list|length }}
+{{ 'name' in user }}|{{ user['age'] + 1 }}|{{ user|dictsort|first }}|{{ LIMITS.max }}

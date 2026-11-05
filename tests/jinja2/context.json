@@ -1,0 +1,27 @@
+{
+  "name": "ada lovelace",
+  "title": "hello-big-world",
+  "path": "/docs/index",
+  "csv": "a,b,c",
+  "tags": ["rust", "python", "jinja"],
+  "code": "0042",
+  "price": 1234.5,
+  "item": "widget",
+  "ratio": 0.256,
+  "none_value": null,
+  "html": "<b>Tom & 'Jerry'</b> \"quoted\"",
+  "totals": [3, 7, 2, 9],
+  "user": {"name": "Ada", "age": 36, "email": "ada@example.com", "active": true},
+  "users": [
+    {"name": "ada", "age": 36, "active": true, "team": "core"},
+    {"name": "bob", "age": 25, "active": false, "team": "web"},
+    {"name": "cy", "age": 41, "active": true, "team": "core"},
+    {"name": "dee", "age": 30, "active": true, "team": "web"}
+  ],
+  "items": [
+    {"name": "bolt", "qty": 3, "price": 0.25},
+    {"name": "nut", "qty": 10, "price": 0.1},
+    {"name": "gear", "qty": 1, "price": 12.0}
+  ],
+  "text": "The quick brown fox jumps over the lazy dog"
+}

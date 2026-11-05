@@ -1,0 +1,9 @@
+None|m|e|rust, python, jinja
+ada/bob/cy/dee|['ada', 'cy', 'dee']|{'name': 'bob', 'age': 25, 'active': False, 'team': 'web'}
+14|bobdeeadacy|9|2
+core:2 web:2 
+3.14|2.0|43|2.5|3|3|9
+[3, 1, 2]|[9, 2, 7, 3]|[[3, 7, 2], [9]]|The quick brown...|9
+x|Hello World|Hello|a+b|['a', 'b', 'c']
+42|  x  |a
+  b|12.35|4

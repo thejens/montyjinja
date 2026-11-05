@@ -1,0 +1,6 @@
+odd:rust even:python odd:jinja even
+rust, python, jinja|, 
+1 Byte|999 Bytes|123.5 MB|117.7 MiB
+Hi there & bye|   mid   |The qui...
+[2]|2;|dict_items([('name', 'Ada'), ('age', 36), ('email', 'ada@example.com'), ('active', True)])|dict_keys(['name', 'age', 'email', 'active'])
+range(0, 3)|4|('name', 'Ada')|brown

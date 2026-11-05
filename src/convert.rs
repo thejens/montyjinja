@@ -5,7 +5,10 @@
 //! the main per-call cost besides interpretation itself, so callers should
 //! pass the data a function needs rather than whole contexts.
 
-use minijinja::value::ValueKind;
+use std::fmt;
+use std::sync::Arc;
+
+use minijinja::value::{Enumerator, Object, ObjectRepr, Tuple, ValueKind};
 use minijinja::{Error, ErrorKind, Value};
 use monty_types::{MontyObject, ObjectRef};
 
@@ -36,6 +39,13 @@ fn to_monty_at(value: &Value, depth: usize) -> Result<MontyObject, Error> {
         ValueKind::Number => number_to_monty(value),
         ValueKind::String => MontyObject::string(value.as_str().unwrap_or_default()),
         ValueKind::Bytes => MontyObject::bytes(value.as_bytes().unwrap_or_default()),
+        // Jinja tuples (`(1, 2)`, loop unpacking) stay tuples, as in Jinja2.
+        ValueKind::Seq if value.is_tuple() => MontyObject::tuple(
+            value
+                .try_iter()?
+                .map(|item| to_monty_at(&item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         ValueKind::Seq | ValueKind::Iterable => MontyObject::list(
             value
                 .try_iter()?
@@ -76,6 +86,103 @@ fn number_to_monty(value: &Value) -> MontyObject {
     }
     // Only u128 values above i128::MAX are left.
     u128::try_from(value.clone()).map_or_else(|_| MontyObject::none(), |big| MontyObject::bigint(big.into()))
+}
+
+/// Python call arguments converted from a MiniJinja call.
+pub(crate) struct PyArgs {
+    pub(crate) positional: Vec<MontyObject>,
+    pub(crate) keyword: Vec<(MontyObject, MontyObject)>,
+}
+
+/// Converts MiniJinja call arguments into Python positional and keyword
+/// arguments. MiniJinja passes keyword arguments as a trailing map value.
+pub(crate) fn split_kwargs(args: &[Value]) -> Result<PyArgs, Error> {
+    let (positional, kwargs) = match args.split_last() {
+        Some((last, rest)) if last.is_kwargs() => (rest, Some(last)),
+        _ => (args, None),
+    };
+    let positional = positional.iter().map(to_monty).collect::<Result<_, _>>()?;
+    let mut pairs = Vec::new();
+    if let Some(kwargs) = kwargs {
+        for key in kwargs.try_iter()? {
+            let value = kwargs.get_item(&key)?;
+            pairs.push((to_monty(&key)?, to_monty(&value)?));
+        }
+    }
+    Ok(PyArgs {
+        positional,
+        keyword: pairs,
+    })
+}
+
+/// Defines `__mj_view__(x)`, which pairs a result with how it must reach
+/// the template: `(x, None)` for values that convert directly, and
+/// `(list(x), repr(x))` for other iterables.
+///
+/// Monty hands dict views, ranges, iterators and generators to the host as
+/// opaque text, so a template could neither loop over nor index them. Jinja2
+/// can, and filters returning generators are common, so their items are
+/// materialised in Python and the repr is kept for printing. Every line is
+/// part of the line count of any prelude that embeds it.
+pub(crate) const PY_VIEW_HELPER: &str = "def __mj_view__(x):\n    \
+if x is None or isinstance(x, (str, bytes, list, tuple, dict, set, frozenset, int, float, bool)):\n        \
+return (x, None)\n    \
+try:\n        \
+text = repr(x)\n        \
+return (list(x), text)\n    \
+except TypeError:\n        \
+return (x, None)\n";
+/// Lines in [`PY_VIEW_HELPER`].
+pub(crate) const PY_VIEW_HELPER_LINES: u32 = 8;
+
+/// Converts a `__mj_view__` pair back into a template value.
+pub(crate) fn from_monty_result(pair: ObjectRef<'_>) -> Result<Value, Error> {
+    let parts = pair.items().unwrap_or_default();
+    match parts.as_slice() {
+        [items, repr] => match repr.as_str() {
+            Some(repr) => {
+                let items = match from_monty(*items)?.try_iter() {
+                    Ok(iter) => iter.collect(),
+                    Err(err) => return Err(err),
+                };
+                Ok(Value::from_object(PyView {
+                    items,
+                    repr: repr.to_owned(),
+                }))
+            }
+            None => from_monty(*items),
+        },
+        _ => Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "python result is not a (value, view) pair",
+        )),
+    }
+}
+
+/// A Python iterable that is not a list (a dict view, `range`, a
+/// generator): iterates and indexes like a sequence, prints as Python would.
+#[derive(Debug)]
+pub(crate) struct PyView {
+    items: Vec<Value>,
+    pub(crate) repr: String,
+}
+
+impl Object for PyView {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.items.get(key.as_usize()?).cloned()
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Seq(self.items.len())
+    }
+
+    fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.repr)
+    }
 }
 
 /// Converts a Python value back into a template value.
@@ -122,11 +229,17 @@ fn from_monty_at(value: ObjectRef<'_>, depth: usize) -> Result<Value, Error> {
         _ => {}
     }
     if let Some(items) = value.items() {
-        return items
+        let items = items
             .into_iter()
             .map(|item| from_monty_at(item, depth + 1))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::from);
+            .collect::<Result<Vec<_>, _>>()?;
+        // Tuples keep their identity so they render as `(1, 2)`, as Jinja2
+        // prints them; lists, sets and the like become plain sequences.
+        return Ok(if value.type_name() == "tuple" {
+            Value::from_object(Tuple::new(items))
+        } else {
+            Value::from(items)
+        });
     }
     if let Some(pairs) = value.pairs() {
         // Insertion order survives: the crate enables MiniJinja's

@@ -1,0 +1,5 @@
+{% set greeting = 'hi ' ~ user.name %}{{ greeting }}
+{% set block %}captured {{ tags|length }}{% endset %}{{ block|upper }}
+{% set ns = namespace(total=0) %}{% for i in items %}{% set ns.total = ns.total + i.qty %}{% endfor %}{{ ns.total }}
+{% with a = 1, b = 2 %}{{ a + b }}{% endwith %}|{% filter upper %}shout {{ name }}{% endfilter %}
+{% set x, y = 1, 2 %}{{ x }}{{ y }}|{{ 'yes' if user.active else 'no' }}|{{ user.age > 30 and user.active }}
