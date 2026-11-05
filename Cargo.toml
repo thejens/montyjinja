@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-description = "Python-powered filters, tests, globals and inline blocks for MiniJinja, sandboxed by Monty"
+description = "Write MiniJinja template filters, tests, globals and inline blocks in Python, sandboxed in-process by Pydantic's Monty interpreter"
+readme = "README.md"
+homepage = "https://github.com/thejens/montyjinja"
 repository = "https://github.com/thejens/montyjinja"
-keywords = ["jinja", "templates", "python", "sandbox", "minijinja"]
+keywords = ["minijinja", "jinja", "python", "templates", "sandbox"]
 categories = ["template-engine"]
 publish = false
 
