@@ -32,8 +32,26 @@ for region in regions:
 {% endpython %}
 ```
 
+## What montyjinja adds to MiniJinja
+
+- **Python Jinja2 compatibility.** Templates written for Python's Jinja2 render the same: Python methods on
+  values (`.format()`, `.items()`, `.split()`), Python-style printing and MarkupSafe escaping, `|format` with
+  Python's `%`, and the Jinja2 built-ins MiniJinja lacks. A [conformance suite](#jinja2-compatibility) checks
+  the output against real Jinja2.
+- **Filters, tests and globals written in Python.** Register them with decorators, or Jinja2-style with
+  `env.filters['name'] = fn`, so an existing Jinja2 `filters.py` loads unchanged.
+- **Inline Python.** `{{ py("...") }}` expressions and `{% python %}...{% endpython %}` blocks that read
+  template variables directly.
+- **Python-to-template callbacks.** Python code can call `render()`, `render_string()` and `apply_filter()`,
+  and catch template errors as exceptions.
+- **Per-render memoization.** Functions marked `pure=True` reuse results for repeated arguments within a
+  render.
+- **Sandboxing.** Everything runs in Monty, in-process: no filesystem, environment or network access, with
+  memory, time and recursion limits on every call. No CPython.
+
 ## Contents
 
+- [What montyjinja adds to MiniJinja](#what-montyjinja-adds-to-minijinja)
 - [Why montyjinja?](#why-montyjinja)
 - [Installation](#installation)
 - [Quick start](#quick-start)
