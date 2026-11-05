@@ -1,10 +1,16 @@
-# montyjinja
+# montyjinja: Python filters and inline Python for MiniJinja
 
-**Proof of concept:** Python-powered templating for [MiniJinja](https://github.com/mitsuhiko/minijinja),
-executed by [Monty](https://github.com/pydantic/monty), Pydantic's sandboxed Python interpreter written in Rust.
+[![CI](https://github.com/thejens/montyjinja/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/montyjinja/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)
 
-No CPython, no subprocess, no FFI. It is one Rust binary, and every Python call runs under memory, time and
-recursion limits.
+**Write [MiniJinja](https://github.com/mitsuhiko/minijinja) template filters, tests, global functions and inline
+code blocks in Python, from Rust.** The Python runs in-process in [Monty](https://github.com/pydantic/monty),
+Pydantic's sandboxed Python interpreter written in Rust. You get Jinja2-style Python extensibility for Rust
+templating without embedding CPython, pyo3, subprocesses or WebAssembly, and every call runs under memory, time
+and recursion limits.
+
+> **Status:** a working proof of concept with tests, benchmarks and CI. It is not published to crates.io.
 
 ```jinja
 {# filters, tests and globals written in Python #}
@@ -21,12 +27,94 @@ for region in regions:
 {% endpython %}
 ```
 
-## Verdict
+## Contents
+
+- [Why montyjinja?](#why-montyjinja)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Performance](#performance)
+- [How it works](#how-it-works)
+- [Value mapping](#value-mapping)
+- [Limitations](#limitations)
+- [FAQ](#faq)
+- [Development](#development)
+
+## Why montyjinja?
+
+MiniJinja keeps its expression language small on purpose: anything beyond it is written as Rust filters and
+functions compiled into the host. That causes problems montyjinja addresses:
+
+- **Templates can't be extended at runtime.** Custom filters need a Rust change and a redeploy. With
+  montyjinja, a `.py` file loaded at runtime registers its filters, tests and globals. Users, operators or a CMS
+  can extend templates without a Rust toolchain.
+- **Macros can only return strings.** Python functions return real values (dicts, lists, numbers) that the
+  template can index, loop over and pass on.
+- **Jinja expressions are limited.** Comprehensions, `sorted(key=...)`, `try`/`except`, `while` and functions
+  with local variables are ordinary Python in `py()` and `{% python %}` blocks. No more `namespace()`
+  workarounds.
+- **Embedding CPython is heavy and unsandboxed.** Monty is pure Rust and runs in-process with no filesystem,
+  environment or network access, plus per-call resource limits.
+- **Porting from Python Jinja2 loses your filters.** Simple Jinja2 Python filters run unchanged, as long as they
+  stay within Monty's Python subset.
+
+## Installation
+
+The crate is not on crates.io; depend on it from Git:
+
+```toml
+[dependencies]
+minijinja = "3"
+montyjinja = { git = "https://github.com/thejens/montyjinja" }
+```
+
+## Quick start
+
+```rust
+use minijinja::{Environment, context};
+use montyjinja::{Config, MontyJinja};
+
+let mut monty = MontyJinja::new(Config::default());
+monty.add_module("filters.py", r#"
+@template_filter
+def initials(name):
+    return ''.join(part[0].upper() for part in name.split())
+
+@template_test('prime', pure=True)  # results reused within a render
+def is_prime(n):
+    return n > 1 and all(n % d for d in range(2, n))
+"#)?;
+
+let mut env = Environment::new();
+monty.install(&mut env); // module exports + py() + py_block
+env.render_str("{{ who|initials }} {{ 7 is prime }}", context! { who => "ada lovelace" })?;
+// → "AL True"
+```
+
+`{% python %}` blocks need the source expanded before MiniJinja parses it:
+
+```rust
+use montyjinja::{expand_python_tags, python_tag_loader};
+
+env.set_loader(python_tag_loader(minijinja::path_loader("templates")));      // loaded templates
+env.add_template_owned("page.html", expand_python_tags(source)?.into_owned())?; // added templates
+env.render_str(&expand_python_tags("{% python %}print(1 + 1){% endpython %}")?, ())?;
+```
+
+Module state can live for a whole render instead of a single call:
+
+```rust
+let monty = MontyJinja::new(Config { isolation: Isolation::PerRender, ..Config::default() });
+```
+
+See [`examples/report.rs`](examples/report.rs), [`examples/python/report.py`](examples/python/report.py) and
+[`examples/templates/report.md`](examples/templates/report.md) for a fuller demo (`make example`).
+
+## Features
 
 **Yes, it works, and it is cheap enough to use for real.** Python adds expressiveness to MiniJinja that Jinja's
-expression language lacks: comprehensions, `sorted(key=...)`, `zip`, f-strings with format specs, `divmod`, real
-functions with local state, and exceptions. Template authors get that without the host shipping a Python runtime
-or handing them unsandboxed code execution.
+expression language lacks, and template authors get it without the host shipping a Python runtime or handing
+them unsandboxed code execution.
 
 | What you get                                                        | How                                                           |
 | ------------------------------------------------------------------- | ------------------------------------------------------------- |
@@ -123,49 +211,7 @@ Where the time goes:
   the VM, and the host runs MiniJinja with the live `State` before resuming. A template error becomes a
   catchable Python `RuntimeError`.
 
-## Usage
-
-```rust
-use minijinja::{Environment, context};
-use montyjinja::{Config, MontyJinja};
-
-let mut monty = MontyJinja::new(Config::default());
-monty.add_module("filters.py", r#"
-@template_filter
-def initials(name):
-    return ''.join(part[0].upper() for part in name.split())
-
-@template_test('prime', pure=True)  # results reused within a render
-def is_prime(n):
-    return n > 1 and all(n % d for d in range(2, n))
-"#)?;
-
-let mut env = Environment::new();
-monty.install(&mut env); // module exports + py() + py_block
-env.render_str("{{ who|initials }} {{ 7 is prime }}", context! { who => "ada lovelace" })?;
-// → "AL True"
-```
-
-`{% python %}` blocks need the source expanded before MiniJinja parses it:
-
-```rust
-use montyjinja::{expand_python_tags, python_tag_loader};
-
-env.set_loader(python_tag_loader(minijinja::path_loader("templates")));      // loaded templates
-env.add_template_owned("page.html", expand_python_tags(source)?.into_owned())?; // added templates
-env.render_str(&expand_python_tags("{% python %}print(1 + 1){% endpython %}")?, ())?;
-```
-
-Module state can live for a whole render instead of a single call:
-
-```rust
-let monty = MontyJinja::new(Config { isolation: Isolation::PerRender, ..Config::default() });
-```
-
-See [`examples/report.rs`](examples/report.rs), [`examples/python/report.py`](examples/python/report.py) and
-[`examples/templates/report.md`](examples/templates/report.md) for a fuller demo (`make example`).
-
-### Value mapping
+## Value mapping
 
 | MiniJinja                        | Python                     | Back to MiniJinja                       |
 | -------------------------------- | -------------------------- | --------------------------------------- |
@@ -176,9 +222,9 @@ See [`examples/report.rs`](examples/report.rs), [`examples/python/report.py`](ex
 | map                              | `dict` (order kept)        | map, order kept (`preserve_order`)      |
 | other objects                    | `str(value)`               | class/dataclass instances → map; decimals → string; else `repr()` |
 
-## Findings and limitations
+## Limitations
 
-These are things the POC ran into, ordered by how much they would matter for a real implementation.
+Ordered by how much they would matter for production use.
 
 - **In-process only.** Monty's sandbox stops Python-level escapes, and Rust panics inside the interpreter are
   contained. A stack overflow or allocator abort still takes the host process down, as does any panic in a
@@ -208,13 +254,44 @@ These are things the POC ran into, ordered by how much they would matter for a r
 - **Line offsets.** The prelude must stay on one line, and tracebacks are shifted back by one line. Synthetic
   dispatch frames are hidden.
 
-### Ideas beyond the POC
+## Roadmap ideas
 
 - Type-check modules at load time with `monty-type-checking`, so template authors get errors before rendering.
 - Support `import` between Python modules through `OsFunctionCall::Import` → `ModuleFile`.
 - Memoize `py()` snippets. They read template variables implicitly, so the key would have to include every
   name the snippet looked up.
 - Expose `monty-pool` as an alternative backend for multi-tenant or untrusted templates.
+
+## FAQ
+
+### How do I write MiniJinja filters in Python?
+
+Decorate functions with `@template_filter`, `@template_test` or `@template_global`, load the file with
+`MontyJinja::add_module`, and call `install` on your `Environment`. See [Quick start](#quick-start).
+
+### Is it safe to render user-supplied templates that contain Python?
+
+Monty blocks filesystem, environment and network access, and montyjinja enforces memory, time, recursion,
+output and host-call limits on every call. Rust panics inside the interpreter are contained. A stack overflow
+or allocator abort can still take down the process, so for hostile multi-tenant input, run rendering in a
+separate process. See [Limitations](#limitations).
+
+### How is this different from embedding Python with pyo3?
+
+pyo3 embeds CPython: the full language and its packages, but with no sandbox, a native dependency, and
+CPython's global interpreter lock. Monty implements a subset of Python in pure Rust, with no third-party packages,
+but it is sandboxed by design, starts in microseconds and renders on many threads at once.
+
+### Can I reuse Python Jinja2 filters?
+
+Often, yes. A Jinja2 filter that is a plain function and avoids third-party imports usually works unchanged
+under `@template_filter`. Filters that rely on Jinja2's Python API (`Markup`, `pass_context`) need adapting.
+
+### Is it fast enough?
+
+A Python filter call costs about 4–16 µs, against about 0.5 µs for a native Rust filter. Repeated calls to
+`pure=True` functions are served from a per-render cache. A page with hundreds of Python calls still renders
+in milliseconds. See [Performance](#performance).
 
 ## Development
 
@@ -227,6 +304,11 @@ make bench     # performance table above
 
 Requires Rust 1.96+ (Monty's MSRV).
 
+## Acknowledgements
+
+Built on [MiniJinja](https://github.com/mitsuhiko/minijinja) by Armin Ronacher and
+[Monty](https://github.com/pydantic/monty) by Pydantic.
+
 ## License
 
-MIT
+[MIT](LICENSE)
