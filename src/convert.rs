@@ -141,10 +141,7 @@ pub(crate) fn from_monty_result(pair: ObjectRef<'_>) -> Result<Value, Error> {
     match parts.as_slice() {
         [items, repr] => match repr.as_str() {
             Some(repr) => {
-                let items = match from_monty(*items)?.try_iter() {
-                    Ok(iter) => iter.collect(),
-                    Err(err) => return Err(err),
-                };
+                let items = from_monty(*items)?.try_iter()?.collect();
                 Ok(Value::from_object(PyView {
                     items,
                     repr: repr.to_owned(),
