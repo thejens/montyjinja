@@ -39,6 +39,7 @@ or handing them unsandboxed code execution.
 | Runaway code stopped                                                | `ResourceLimits` (default: 32 MiB, 250 ms, recursion depth 200) |
 | Interpreter panics contained                                        | Every Monty step runs under `catch_unwind` and fails as a Python `RuntimeError` |
 | Module state per call or per render                                 | `Isolation::PerCall` (default) or `Isolation::PerRender`      |
+| Repeated calls served from a per-render cache                      | `@template_filter(pure=True)` (also on tests and globals)     |
 | Real Python tracebacks with the right line numbers                  | `PythonError` attached as the MiniJinja error's `source()`    |
 | Thread-safe rendering                                               | Programs are forked per call; there is no global interpreter lock |
 
@@ -55,6 +56,7 @@ the ratios are stable.
 | Python module filter, module with only `def`s |           ~16 µs   |    ~12 µs |     ~4 µs |
 | … same, with a 20-row list of dicts argument  |           ~47 µs   |    ~36 µs |    ~28 µs |
 | Python module filter, module builds a 2000-entry table at top level |  ~165 µs   |   ~590 µs |   ~3.5 µs |
+| `pure=True` filter, same 20-row argument every call (cache hit) |  ~4.5 µs   |   ~4.5 µs |   ~4.5 µs |
 
 `Snapshot` and `Reexecute` are `ModuleStrategy` values with the default `Isolation::PerCall`; `PerRender` is
 `Isolation::PerRender` on top of `Snapshot`.
@@ -73,6 +75,9 @@ Where the time goes:
    state.
 2. **Value conversion.** MiniJinja values are deep-copied into the sandbox heap and back. This is what is left
    under `PerRender` with a 20-row argument. Pass the slice of data a function needs, not the whole context.
+3. **Memoization.** A function registered with `pure=True` caches its results per render, keyed by its
+   arguments, so a repeated call skips both conversion and Python. What remains on a hit is fingerprinting the
+   arguments.
 
 ## How it works
 
@@ -105,6 +110,10 @@ Where the time goes:
 - **`{% python %}`.** MiniJinja has no custom-tag API, so [`expand_python_tags`](src/tags.rs) rewrites
   `{% python args %}body{% endpython %}` to `{% call py_block(args) %}{% raw %}body{% endraw %}{% endcall %}`
   in the source, on the same lines. `python_tag_loader` applies it to every loaded template.
+- **Memoization.** A `pure=True` call is keyed by the callee plus a type-tagged fingerprint of the template
+  values it receives. MiniJinja's own equality treats `1`, `1.0` and `true` as equal, but a Python function may
+  not, so the key keeps them apart. Results live in a render-local extension, capped by `Config::memo_capacity`
+  (default 1,024 per render). Exceptions are never cached.
 - **Panic containment.** Each interpreter step runs inside `catch_unwind`. A panic in Monty fails that call
   with `RuntimeError: internal interpreter error: …`; host callbacks run outside the boundary.
 - **Inline code.** `py()` and `py_block` compile the snippet once per (source, keyword names) and cache it.
@@ -126,7 +135,7 @@ monty.add_module("filters.py", r#"
 def initials(name):
     return ''.join(part[0].upper() for part in name.split())
 
-@template_test('prime')
+@template_test('prime', pure=True)  # results reused within a render
 def is_prime(n):
     return n > 1 and all(n % d for d in range(2, n))
 "#)?;
@@ -181,6 +190,8 @@ These are things the POC ran into, ordered by how much they would matter for a r
   Python string. `python_tag_loader` drops `path_loader`'s auto-reload check, which MiniJinja keeps private.
   Plain `{% call py_block() %}` still works; its body is rendered as a template first, so `{{` inside it is
   template syntax.
+- **`pure=True` is a promise, not a check.** A function that marks itself pure but reads mutable module state
+  (possible under `PerRender`) returns stale results from the cache.
 - **`PerRender` trades isolation for speed.** Calls in one render share module globals, and memory accumulates
   against `max_memory` for the whole render. A filter that re-enters its own module through `apply_filter`
   gets a pristine state for the nested call.
@@ -201,7 +212,8 @@ These are things the POC ran into, ordered by how much they would matter for a r
 
 - Type-check modules at load time with `monty-type-checking`, so template authors get errors before rendering.
 - Support `import` between Python modules through `OsFunctionCall::Import` → `ModuleFile`.
-- Memoize pure functions and `py()` snippets per render, keyed by arguments.
+- Memoize `py()` snippets. They read template variables implicitly, so the key would have to include every
+  name the snippet looked up.
 - Expose `monty-pool` as an alternative backend for multi-tenant or untrusted templates.
 
 ## Development

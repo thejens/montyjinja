@@ -11,16 +11,17 @@ use crate::error::LoadError;
 /// `PRELUDE_LINES`. Monty has neither `callable()` nor `fn.__name__`, so a
 /// bare `@template_filter` is told apart from `@template_filter('name')` by
 /// argument type, and bare names are recovered from the function's repr
-/// after the module runs (see `function_name_from_repr`).
+/// after the module runs (see `function_name_from_repr`). Each registry
+/// entry is `(explicit name or None, function, pure)`.
 pub(super) const PRELUDE: &str = "__mj_reg__ = {'filter': [], 'test': [], 'global': []}; \
-__mj_dec__ = lambda k, a: (lambda fn: (__mj_reg__[k].append((a, fn)), fn)[1]) if a is None or isinstance(a, str) else (__mj_reg__[k].append((None, a)), a)[1]; \
-template_filter = lambda a=None: __mj_dec__('filter', a); \
-template_test = lambda a=None: __mj_dec__('test', a); \
-template_global = lambda a=None: __mj_dec__('global', a)\n";
+__mj_dec__ = lambda k, a, p: (lambda fn: (__mj_reg__[k].append((a, fn, p)), fn)[1]) if a is None or isinstance(a, str) else (__mj_reg__[k].append((None, a, p)), a)[1]; \
+template_filter = lambda a=None, pure=False: __mj_dec__('filter', a, pure); \
+template_test = lambda a=None, pure=False: __mj_dec__('test', a, pure); \
+template_global = lambda a=None, pure=False: __mj_dec__('global', a, pure)\n";
 pub(super) const PRELUDE_LINES: u32 = 1;
 
 /// What a Python function is registered as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExportKind {
     Filter,
     Test,
@@ -44,6 +45,8 @@ impl ExportKind {
 pub struct Export {
     pub kind: ExportKind,
     pub name: String,
+    /// Registered with `pure=True`: results are memoized per render.
+    pub pure: bool,
     pub(super) index: usize,
 }
 
@@ -61,9 +64,15 @@ pub(super) fn parse_registry(registry: ObjectRef<'_>) -> Result<Vec<Export>, Loa
             .ok_or_else(|| invalid("registry is missing a kind"))?;
         for (index, entry) in entries.into_iter().enumerate() {
             let parts = entry.items().ok_or_else(|| invalid("malformed registry entry"))?;
-            let [explicit, function] = parts.as_slice() else {
+            let [explicit, function, pure] = parts.as_slice() else {
                 return Err(invalid("malformed registry entry"));
             };
+            let pure = pure.as_bool().ok_or_else(|| {
+                LoadError::Invalid(format!(
+                    "pure= must be True or False for {}",
+                    repr_text(*function)
+                ))
+            })?;
             let name = match explicit.as_str() {
                 Some(name) => name.to_owned(),
                 None => function_name_from_repr(&repr_text(*function)).ok_or_else(|| {
@@ -75,7 +84,12 @@ pub(super) fn parse_registry(registry: ObjectRef<'_>) -> Result<Vec<Export>, Loa
                     ))
                 })?,
             };
-            exports.push(Export { kind, name, index });
+            exports.push(Export {
+                kind,
+                name,
+                pure,
+                index,
+            });
         }
     }
     Ok(exports)

@@ -18,6 +18,10 @@ def slugify(text):
 @template_filter
 def total(rows):
     return sum(r['qty'] * r['price'] for r in rows)
+
+@template_filter(pure=True)
+def total_pure(rows):
+    return sum(r['qty'] * r['price'] for r in rows)
 "#;
 
 /// The top level builds a lookup table: expensive to re-run, and a larger
@@ -73,6 +77,10 @@ fn main() {
         (
             "filter, heavy module",
             "{% for t in titles %}{{ loop.index|lookup }}{% endfor %}",
+        ),
+        (
+            "pure filter, same 20-row arg",
+            "{% for t in titles %}{{ rows|total_pure }}{% endfor %}",
         ),
     ];
 

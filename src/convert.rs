@@ -12,7 +12,7 @@ use monty_types::{MontyObject, ObjectRef};
 /// Nesting cap for both directions. MiniJinja values can be self-referential
 /// through dynamic objects, and Monty graphs can share sub-objects; the cap
 /// turns a cycle into an error instead of a stack overflow.
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 /// Converts a template value into a Python value.
 ///
@@ -63,15 +63,19 @@ fn to_monty_at(value: &Value, depth: usize) -> Result<MontyObject, Error> {
 }
 
 fn number_to_monty(value: &Value) -> MontyObject {
+    // Checked first because `as_i64` also accepts whole floats: `1.0` must
+    // reach Python as a float, not the int `1`.
+    if !value.is_integer() {
+        return f64::try_from(value.clone()).map_or_else(|_| MontyObject::none(), MontyObject::float);
+    }
     if let Some(int) = value.as_i64() {
         return MontyObject::int(int);
     }
-    if value.is_integer()
-        && let Ok(big) = i128::try_from(value.clone())
-    {
+    if let Ok(big) = i128::try_from(value.clone()) {
         return MontyObject::bigint(big.into());
     }
-    f64::try_from(value.clone()).map_or_else(|_| MontyObject::none(), MontyObject::float)
+    // Only u128 values above i128::MAX are left.
+    u128::try_from(value.clone()).map_or_else(|_| MontyObject::none(), |big| MontyObject::bigint(big.into()))
 }
 
 /// Converts a Python value back into a template value.

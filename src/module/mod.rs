@@ -11,6 +11,7 @@
 //!     return n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
 //! ```
 
+mod memo;
 mod registry;
 
 use std::collections::HashMap;
@@ -196,6 +197,13 @@ impl ModuleInner {
     }
 
     fn call(&self, state: &mut State<'_, '_>, export: &Export, args: &[Value]) -> Result<Value, Error> {
+        let memo_key = export
+            .pure
+            .then(|| memo::MemoKey::new(self.id(), export, args))
+            .flatten();
+        if let Some(hit) = memo_key.as_ref().and_then(|key| memo::lookup(state, key)) {
+            return Ok(hit);
+        }
         let args = split_kwargs(args)?;
         let checkpoint = self.invoke(state, export, args).map_err(|err| {
             err.into_template_error(&format!("python {} '{}'", export.kind.key(), export.name))
@@ -207,7 +215,11 @@ impl ModuleInner {
                 .0
                 .insert(self.id(), checkpoint);
         }
-        Ok(result.unwrap_or_default())
+        let result = result.unwrap_or_default();
+        if let Some(key) = memo_key {
+            memo::store(state, key, result.clone(), self.config.memo_capacity);
+        }
+        Ok(result)
     }
 
     /// Runs one call and returns the checkpoint the module suspends at

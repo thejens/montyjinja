@@ -21,6 +21,10 @@ pub struct Config {
     pub module_strategy: ModuleStrategy,
     /// How long module state lives: one call, or one render.
     pub isolation: Isolation,
+    /// Maximum results of `pure=True` functions memoized per render, across
+    /// all modules. Once reached, further results are computed but not
+    /// stored. `0` disables memoization.
+    pub memo_capacity: usize,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             max_host_calls: 1_000,
             module_strategy: ModuleStrategy::default(),
             isolation: Isolation::default(),
+            memo_capacity: 1_024,
         }
     }
 }

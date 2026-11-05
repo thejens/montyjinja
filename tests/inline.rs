@@ -111,3 +111,17 @@ for k, v in sorted(cfg.items()):
         .unwrap();
     assert_eq!(out, "[a=1][b=2]");
 }
+
+#[test]
+fn numbers_keep_their_python_type() {
+    let out = env()
+        .render_str(
+            r#"{{ py("[isinstance(v, float) for v in (a, b, c, d)]", a=1.0, b=1, c=2.5, d=big) }} {{ py("big - 1") }}"#,
+            context! { big => u128::MAX },
+        )
+        .unwrap();
+    assert_eq!(
+        out,
+        "[True, False, True, False] 340282366920938463463374607431768211454"
+    );
+}
